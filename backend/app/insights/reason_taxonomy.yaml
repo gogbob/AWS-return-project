@@ -1,0 +1,72 @@
+# reason_taxonomy.yaml — insights/
+# Maps every distinct raw `reason` value observed in the OMS data to a
+# canonical reason code and canonical group.
+#
+# Source: docs/data_profile.md — "Distinct Values — reason" section.
+# All keys are lowercase-stripped; matching is case-insensitive and
+# whitespace-tolerant (handled by the engine).
+# Unmapped values fall through to code: other, group: OTHER.
+
+mappings:
+  # ── Defect / Quality ──────────────────────────────────────────────────────
+  defective: defect
+  manufacturer defect: defect
+  return.page.reasons.manufacturer defect: defect
+  poor quality: defect
+  warranty: defect
+  arrived in poor condition: defect
+  return.page.reasons.arrived in poor cond: defect
+
+  # ── Description / Expectation mismatch ───────────────────────────────────
+  not as advertised: not_as_described
+  not what i expected: not_as_described
+  return.page.reasons.not what i expected: not_as_described
+  "return.page.reasons.ne répond pas aux at": not_as_described
+  wrong item: not_as_described
+  wrong item delivered: not_as_described
+  return.page.reasons.wrong item delivered: not_as_described
+  wrong size delivered: not_as_described
+  return.page.reasons.wrong size delivered: not_as_described
+
+  # ── Fit / Size ────────────────────────────────────────────────────────────
+  too big: too_big
+  return.page.reasons.too big: too_big
+  return.page.reasons.trop grand: too_big
+  too small: too_small
+  return.page.reasons.too small: too_small
+  uncomfortable: too_narrow          # mapped to FIT_SIZE group
+  return.page.reasons.uncomfortable: too_narrow
+  # mismapped in source — correct to FIT_SIZE per data_profile.md
+  return.page.reasons.inconfortable: too_narrow
+
+  # ── Preference ────────────────────────────────────────────────────────────
+  not satisfied with the colour: changed_mind
+  found something else: changed_mind
+
+  # ── Other / Discretionary ────────────────────────────────────────────────
+  changed my mind / other: changed_mind
+  "return.page.reasons.changed my mind / ot": changed_mind
+  "return.page.reasons.j'ai changé d'idée /": changed_mind
+  changed idea: changed_mind
+  gift return: other
+  arrived too late: other
+  return.page.reasons.arrived too late: other
+  return extension: other
+  return to sender: other
+  return without merchandise: other
+  return without merch: other
+
+  # ── Fraud-signal codes (operational / logistics anomalies) ───────────────
+  lost in transit: other
+  lost in transit: other      # case variant (last wins — both map the same)
+  missing item: other
+
+  # ── Empty / unknown ───────────────────────────────────────────────────────
+  "": other
+
+canonical_groups:
+  FIT_SIZE: [too_small, too_big, too_narrow, too_wide]
+  DEFECT: [defect]
+  DESCRIPTION: [not_as_described]
+  PREFERENCE: [changed_mind]
+  OTHER: [other]
