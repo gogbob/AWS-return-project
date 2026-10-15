@@ -25,6 +25,8 @@ from ..agents.assistant import build_assistant, run_mock_turn
 from ..agents.vision import VisionSession
 from ..config import settings
 from ..db import get_db
+from ..insights.engine import reason_to_code
+from ..loyalty.loyalty import get_loyalty
 from ..policy.eligibility import check_eligibility
 from ..policy.triage import compute_triage
 
@@ -448,6 +450,86 @@ def _log_triage_decision(case_id: str, db: Session) -> None:
             db,
         )
 
+    # ── PART 3: weighted value added to the item's return-reason bar chart ────
+    # Every logged return contributes a loyalty-weighted value to the item's
+    # distribution. Record that value (held at 0.00 when flagged for review).
+    case_info = db.execute(
+        text(
+            "SELECT customer_id, item_id, reason_code FROM cases WHERE id = :cid"
+        ),
+        {"cid": case_id},
+    ).fetchone()
+    if case_info is not None:
+        cust_id, item_id, reason_code = case_info
+
+        name_row = db.execute(
+            text("SELECT orderitem_product_name FROM order_items WHERE item_id = :iid"),
+            {"iid": item_id},
+        ).fetchone()
+        item_label = name_row[0] if name_row and name_row[0] else (item_id or "the item")
+
+        loyalty = get_loyalty(cust_id, db) if cust_id else 0
+        granular_code = reason_to_code(reason_code)
+        friendly_reason = granular_code.replace("_", " ").capitalize()
+        weight = 0.5 + loyalty / 100.0
+
+        held = (
+            result.outcome.value in ("VISION_REVIEW", "HUMAN_REVIEW")
+            or result.suspicion >= settings.suspicion_threshold
+        )
+        if held:
+            weight_text = "0.00 (held — flagged for review)"
+            detail_text = (
+                f"(reason: {friendly_reason}, loyalty {loyalty} — "
+                "held pending review, not yet counted)"
+            )
+        else:
+            weight_text = f"{weight:.2f}"
+            if loyalty >= settings.high_loyalty_threshold:
+                detail_text = (
+                    f"(reason: {friendly_reason}, loyalty {loyalty} — "
+                    "high-loyalty customer, weighted more heavily)"
+                )
+            else:
+                detail_text = f"(reason: {friendly_reason}, loyalty {loyalty})"
+
+        _append_ai_log(
+            case_id,
+            f"📊 Added a weighted value of {weight_text} to {item_label}'s "
+            f"return-reason chart {detail_text}.",
+            db,
+        )
+
+        # ── PART 4: AI may update the listing when the item overshoots ────────
+        # Guarded so a listing-analysis failure never breaks start_return.
+        try:
+            from app.api.routes_admin import _build_item_insight
+
+            cat_row = db.execute(
+                text("SELECT orderitem_product_name, category FROM order_items WHERE item_id = :iid"),
+                {"iid": item_id},
+            ).fetchone()
+            if cat_row is not None:
+                insight = _build_item_insight(item_id, cat_row[0], cat_row[1], db)
+                if insight is not None and (
+                    insight.get("overshoot") or insight.get("defect_suspected")
+                ):
+                    if insight.get("defect_suspected"):
+                        note = (
+                            f"🛠️ The AI may update the listing for {item_label} — this item is "
+                            "defect-suspected across multiple sizes, so it may recommend removing "
+                            "the product from the site (pending admin confirmation)."
+                        )
+                    else:
+                        note = (
+                            f"🛠️ The AI may update the listing for {item_label} — its return "
+                            "reasons overshoot the category average, so it may adjust the size "
+                            "guidance or product description."
+                        )
+                    _append_ai_log(case_id, note, db)
+        except Exception:  # noqa: BLE001 - listing analysis must never break the return
+            pass
+
 
 # ---------------------------------------------------------------------------
 # 5. POST /api/returns/start
@@ -511,21 +593,36 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
     #     admin activity log (case_messages role='ai_log').
     _log_triage_decision(case_id, db)
 
-    # 3. Start assistant session — generate initial greeting
+    # 3. Start assistant session — generate initial greeting.
+    # Resolve a friendly product name so the agent greets by product, not an id.
+    name_row = db.execute(
+        text("SELECT orderitem_product_name FROM order_items WHERE item_id = :iid"),
+        {"iid": body.item_id},
+    ).fetchone()
+    item_label = (name_row[0] if name_row and name_row[0] else body.item_id)
+
+    # Frame the context so the agent knows the customer/order/item are already
+    # verified and attached to this case — it must NOT ask for identifying info.
+    opening = (
+        f"[System context — the customer is signed in and verified. Case {case_id} "
+        f"already has their account, order {body.order_number}, and item on file. "
+        f"Do not ask for any ID, email, order number, or SKU.]\n\n"
+        f"Customer: I'd like to return my {item_label}. Reason: {body.reason}."
+    )
+
     if settings.llm_mock:
         agent = build_assistant()
-        initial_message = run_mock_turn(
-            agent,
-            f"I'd like to return item {body.item_id} (order {body.order_number}) "
-            f"because: {body.reason}",
-        )
+        initial_message = run_mock_turn(agent, opening)
     else:
         agent = build_assistant()
-        response = agent(
-            f"I'd like to return item {body.item_id} (order {body.order_number}) "
-            f"because: {body.reason}"
-        )
-        initial_message = str(response)
+        response = agent(opening)
+        initial_message = str(response).strip()
+        if not initial_message:
+            initial_message = (
+                f"Thanks for starting a return for your {item_label}. "
+                "Could you tell me a bit more about the issue — for example, "
+                "the size you ordered and how it fit?"
+            )
 
     # Persist initial assistant message
     db.execute(
@@ -553,7 +650,14 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
 
 
 class SendMessageRequest(BaseModel):
-    content: str
+    # The frontend sends { message }. Accept that as the primary field and
+    # keep `content` as an optional alias for backwards compatibility.
+    message: str | None = None
+    content: str | None = None
+
+    @property
+    def text_in(self) -> str:
+        return (self.message or self.content or "").strip()
 
 
 @router.post("/api/returns/{case_id}/message", tags=["Customer"])
@@ -571,6 +675,10 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="Case not found")
 
     customer_id, order_number, sku, item_id, reason_code, status = case_row
+
+    user_text = body.text_in
+    if not user_text:
+        raise HTTPException(status_code=422, detail="Message text is required.")
 
     if status in ("APPROVED_NO_FEE", "APPROVED_WITH_FEE", "REJECTED"):
         raise HTTPException(status_code=400, detail=f"Case is already resolved: {status}")
@@ -592,7 +700,7 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
             "INSERT INTO case_messages (case_id, role, content, created_at) "
             "VALUES (:cid, 'user', :content, :now)"
         ),
-        {"cid": case_id, "content": body.content, "now": datetime.utcnow()},
+        {"cid": case_id, "content": user_text, "now": datetime.utcnow()},
     )
     db.commit()
 
@@ -608,14 +716,44 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
         {"role": row[0], "content": [{"text": row[1]}]} for row in msg_rows
     ]
 
-    # Run one agent turn
-    if settings.llm_mock:
-        agent = build_assistant(messages=history)
-        assistant_message = run_mock_turn(agent, body.content)
-    else:
-        agent = build_assistant(messages=history[:-1])  # last message is the new user turn
-        response = agent(body.content)
-        assistant_message = str(response)
+    # Run one agent turn. Guard the LLM call so a provider error (expired
+    # Bedrock token, throttling, empty completion) degrades gracefully into a
+    # helpful message instead of a 500 that the UI renders as a generic error.
+    CONTACT_FALLBACK = (
+        "Sorry, we couldn't process your message right now. Please try again, "
+        "or reach our support team at returns@aldo-demo.com or 1-800-555-0123 "
+        "and we'll help you finish your return."
+    )
+    # Re-inject the case context each turn so the agent always has the case_id
+    # (needed for its tools) and never asks the customer for identifiers.
+    turn_input = (
+        f"[System context — case_id is {case_id}. The customer is verified; their "
+        f"order and item are on file. Never ask for any ID, order number, or case ID.]\n\n"
+        f"Customer: {user_text}"
+    )
+    try:
+        if settings.llm_mock:
+            agent = build_assistant(messages=history)
+            assistant_message = run_mock_turn(agent, user_text)
+        else:
+            agent = build_assistant(messages=history[:-1])  # last msg is the new user turn
+            response = agent(turn_input)
+            assistant_message = str(response).strip()
+
+        # The real agent can return an empty final turn (e.g. after a tool call
+        # with no closing text). Fall back to a sensible prompt in that case.
+        if not assistant_message:
+            assistant_message = (
+                "Thanks — I've noted that. Is there anything else you'd like to "
+                "add about your return?"
+            )
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully for any LLM/runtime error
+        import logging
+
+        logging.getLogger("uvicorn.error").warning(
+            "send_message agent turn failed for case %s: %s", case_id, exc
+        )
+        assistant_message = CONTACT_FALLBACK
 
     # Persist assistant reply
     db.execute(
@@ -648,7 +786,8 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
     vision_requested = state == "VISION_REVIEW"
 
     return {
-        "assistant_message": assistant_message,
+        # Frontend MessageResponse reads `message`.
+        "message": assistant_message,
         "state": state,
         "fee": fee,
         "vision_requested": vision_requested,

@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import { api, ItemInsight, ItemInsightReason } from '../../api/client';
+import {
+  api,
+  ItemInsight,
+  ItemInsightListEntry,
+  ItemInsightReason,
+} from '../../api/client';
 
 const REASON_LABELS: Record<string, string> = {
   too_small: 'Too small',
@@ -23,16 +28,66 @@ function formatWhen(ts: string | null): string {
 }
 
 export default function ItemInsights() {
-  const [items, setItems] = useState<ItemInsight[]>([]);
+  const [items, setItems] = useState<ItemInsightListEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [openId, setOpenId] = useState<string | null>(null);
+  // Lazily-loaded full analytics, cached per item once expanded.
+  const [details, setDetails] = useState<Record<string, ItemInsight>>({});
+  const [detailLoading, setDetailLoading] = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<Record<string, string>>({});
+  // Delist state keyed by item_id.
+  const [delisting, setDelisting] = useState<string | null>(null);
+  const [delistMsg, setDelistMsg] = useState<Record<string, string>>({});
+  const [delistErr, setDelistErr] = useState<Record<string, string>>({});
+
+  function handleDelist(itemId: string) {
+    if (!window.confirm('Remove this product from the site? This records an applied removal.')) {
+      return;
+    }
+    setDelisting(itemId);
+    setDelistErr((e) => ({ ...e, [itemId]: '' }));
+    api
+      .delistItem(itemId)
+      .then((res) => {
+        setDelistMsg((m) => ({
+          ...m,
+          [itemId]: `Product removed from site · ${formatWhen(res.applied_at)}`,
+        }));
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        setDelistErr((e) => ({ ...e, [itemId]: msg || 'Failed to remove product.' }));
+      })
+      .finally(() => setDelisting((cur) => (cur === itemId ? null : cur)));
+  }
 
   useEffect(() => {
     api
-      .getItemInsights()
+      .getItemInsightsList()
       .then(setItems)
       .finally(() => setLoading(false));
   }, []);
+
+  function toggle(itemId: string) {
+    if (openId === itemId) {
+      setOpenId(null);
+      return;
+    }
+    setOpenId(itemId);
+    // Fetch the heavy analytics only once per item, on first expand.
+    if (!details[itemId] && detailLoading !== itemId) {
+      setDetailLoading(itemId);
+      setDetailError((e) => ({ ...e, [itemId]: '' }));
+      api
+        .getItemInsightDetail(itemId)
+        .then((d) => setDetails((prev) => ({ ...prev, [itemId]: d })))
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          setDetailError((e) => ({ ...e, [itemId]: msg || 'Failed to load analytics.' }));
+        })
+        .finally(() => setDetailLoading((cur) => (cur === itemId ? null : cur)));
+    }
+  }
 
   if (loading) return <p className="text-sm text-gray-400">Loading…</p>;
 
@@ -54,35 +109,35 @@ export default function ItemInsights() {
           Item insights
         </h2>
         <p className="text-xs text-gray-400 mt-1">
-          Each item's return reasons vs. its category average. Items flagged red overshoot the
-          baseline enough to warrant a change.
+          Expand an item to analyse its return reasons vs. its category average. Analytics are
+          computed on demand — only for the item you open.
         </p>
       </div>
 
       <ul className="space-y-2">
         {items.map((item) => {
           const open = openId === item.item_id;
+          const detail = details[item.item_id];
+          const overshoot = detail?.overshoot ?? false;
           const panelId = `item-insight-panel-${item.item_id}`;
           return (
             <li
               key={item.item_id}
-              className={`border rounded ${
-                item.overshoot ? 'border-red-300' : 'border-gray-200'
-              }`}
+              className={`border rounded ${overshoot ? 'border-red-300' : 'border-gray-200'}`}
             >
               <button
                 type="button"
                 aria-expanded={open}
                 aria-controls={panelId}
-                onClick={() => setOpenId(open ? null : item.item_id)}
+                onClick={() => toggle(item.item_id)}
                 className={`w-full text-left px-4 py-3 flex items-center justify-between gap-3 rounded ${
-                  item.overshoot
+                  overshoot
                     ? 'bg-red-50 text-red-800 hover:bg-red-100'
                     : 'bg-white text-black hover:bg-gray-50'
                 }`}
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  {item.overshoot && (
+                  {overshoot && (
                     <span role="img" aria-label="Return rate anomaly warning" className="shrink-0">
                       ⚠
                     </span>
@@ -95,17 +150,17 @@ export default function ItemInsights() {
                 </div>
 
                 <div className="flex items-center gap-2 shrink-0">
-                  {item.overshoot && (
+                  {overshoot && (
                     <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-red-100 text-red-800">
                       Return rate anomaly
                     </span>
                   )}
-                  {item.needs_input && (
+                  {detail?.needs_input && (
                     <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-800">
                       Needs admin input
                     </span>
                   )}
-                  <RecommendationStatus item={item} />
+                  {detail && <RecommendationStatus item={detail} />}
                   <span aria-hidden="true" className="text-gray-400">
                     {open ? '▾' : '▸'}
                   </span>
@@ -114,9 +169,49 @@ export default function ItemInsights() {
 
               {open && (
                 <div id={panelId} className="px-4 py-4 border-t border-gray-200 bg-white">
-                  <ReasonBars reasons={item.reasons} />
-                  {item.recommendation && (
-                    <RecommendationDetail recommendation={item.recommendation} needsInput={item.needs_input} />
+                  {detailLoading === item.item_id && (
+                    <p className="text-sm text-gray-400">Analysing return reasons…</p>
+                  )}
+                  {detailError[item.item_id] && (
+                    <p className="text-sm text-red-600">{detailError[item.item_id]}</p>
+                  )}
+                  {detail && (
+                    <>
+                      {detail.defect_suspected && (
+                        <div className="mb-4 rounded border border-red-300 bg-red-50 p-3">
+                          <p className="flex items-center gap-2 text-sm font-medium text-red-800">
+                            <span role="img" aria-label="Likely defective warning">
+                              ⚠
+                            </span>
+                            Likely defective — all sizes failing
+                          </p>
+                          {delistMsg[item.item_id] ? (
+                            <p className="mt-2 text-sm text-green-700">{delistMsg[item.item_id]}</p>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleDelist(item.item_id)}
+                              disabled={delisting === item.item_id}
+                              className="mt-2 rounded bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-60"
+                            >
+                              {delisting === item.item_id
+                                ? 'Removing…'
+                                : 'Remove product from site (requires confirmation)'}
+                            </button>
+                          )}
+                          {delistErr[item.item_id] && (
+                            <p className="mt-2 text-sm text-red-600">{delistErr[item.item_id]}</p>
+                          )}
+                        </div>
+                      )}
+                      <ReasonBars reasons={detail.reasons} />
+                      {detail.recommendation && (
+                        <RecommendationDetail
+                          recommendation={detail.recommendation}
+                          needsInput={detail.needs_input}
+                        />
+                      )}
+                    </>
                   )}
                 </div>
               )}

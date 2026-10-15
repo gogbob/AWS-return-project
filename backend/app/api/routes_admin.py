@@ -517,159 +517,325 @@ def list_insights(
 _INSIGHT_META_KEYS = {"n", "n_eff", "scope", "n_items"}
 
 
+# Status values that count as a qualifying (resolved) return — must match the
+# filter used by the insights engine (_WEIGHT_SQL in insights/engine.py).
+_RESOLVED_STATUSES = ("RETURN_COMPLETED", "RETURN_RECEIVED", "RETURN_PROCESSED")
+
+
+def _build_item_insight(item_id: str, name, category, db: Session) -> dict | None:
+    """
+    Compute the FULL return-reason analytics for a SINGLE item: item vs.
+    category/global baseline distribution, anomaly flags, overshoot, the latest
+    recommendation, and whether admin input is needed. Returns None if the item
+    has no qualifying returns. This is the only place the heavy engine calls run,
+    and it runs for one item at a time (lazily, when a row is expanded).
+    """
+    item_dist = compute_item_distribution(item_id, db)
+    n = item_dist.get("n", 0)
+    if n == 0:
+        return None
+
+    n_eff = item_dist.get("n_eff", 0.0)
+
+    if category:
+        baseline = compute_category_baseline(category, db)
+    else:
+        baseline = compute_global_baseline(db)
+
+    item_shares = {
+        k: float(v) for k, v in item_dist.items() if k not in _INSIGHT_META_KEYS
+    }
+    baseline_shares = {
+        k: float(v)
+        for k, v in baseline.items()
+        if k not in _INSIGHT_META_KEYS and isinstance(v, (int, float))
+    }
+    codes = set(item_shares) | set(baseline_shares)
+
+    flags_raw = compute_anomaly(item_id, db)
+    flag_by_code = {f.reason_code: f for f in flags_raw}
+
+    reasons = []
+    for code in codes:
+        item_share = item_shares.get(code, 0.0)
+        baseline_share = baseline_shares.get(code, 0.0)
+        flag = flag_by_code.get(code)
+        if flag is not None:
+            excess = flag.excess
+            ratio = flag.ratio
+            significant = flag.significant
+        else:
+            excess = item_share - baseline_share
+            ratio = item_share / max(baseline_share, 1e-9)
+            significant = False
+        reasons.append(
+            {
+                "reason_code": code,
+                # Coerce to native Python types — anomaly flags come back as
+                # numpy scalars (numpy.bool_/float64) which FastAPI can't encode.
+                "item_share": round(float(item_share), 4),
+                "baseline_share": round(float(baseline_share), 4),
+                "excess": round(float(excess), 4),
+                "ratio": round(float(ratio), 4),
+                "significant": bool(significant),
+            }
+        )
+
+    overshooting = [
+        r for r in reasons if r["significant"] and r["excess"] >= settings.flag_min_excess
+    ]
+    overshoot = len(overshooting) > 0
+
+    # Multi-dimension defect detection: if the item's return rate for opposing
+    # fit dimensions (too small AND too big, etc.) all exceed the flag floor,
+    # the problem is likely the product itself rather than one sizing direction.
+    share_by_code = {r["reason_code"]: r["item_share"] for r in reasons}
+    _defect_dims = ("too_small", "too_big", "too_narrow", "too_wide")
+    qualifying = {
+        c
+        for c in _defect_dims
+        if share_by_code.get(c, 0.0) >= settings.flag_min_excess
+    }
+    defect_dimensions = sorted(qualifying)
+    defect_combined_share = round(
+        sum(share_by_code.get(c, 0.0) for c in qualifying), 4
+    )
+    defect_suspected = (
+        len(qualifying) >= 2 and "too_small" in qualifying and "too_big" in qualifying
+    )
+
+    positive_excess = [r["excess"] for r in reasons if r["excess"] > 0]
+    max_excess = round(max(positive_excess), 4) if positive_excess else 0.0
+
+    top_flag = None
+    if overshoot:
+        worst = max(overshooting, key=lambda r: r["excess"])
+        top_flag = {
+            "reason_code": worst["reason_code"],
+            "group": code_to_group(worst["reason_code"]),
+            "excess": worst["excess"],
+            "ratio": worst["ratio"],
+        }
+
+    rec_row = db.execute(
+        text(
+            "SELECT id, recommendation_type, reason_code, draft_text, "
+            "confidence, status, created_at, updated_at "
+            "FROM recommendations WHERE item_id = :iid "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+    recommendation = None
+    if rec_row is not None:
+        recommendation = {
+            "id": rec_row[0],
+            "recommendation_type": rec_row[1],
+            "reason_code": rec_row[2],
+            "draft_text": rec_row[3],
+            "confidence": rec_row[4],
+            "status": rec_row[5],
+            "created_at": rec_row[6],
+            "updated_at": rec_row[7],
+        }
+
+    has_proposed = recommendation is not None and recommendation["status"] == "proposed"
+    has_applied = recommendation is not None and recommendation["status"] == "applied"
+    defect_flag = any(
+        r["significant"] and code_to_group(r["reason_code"]) == "DEFECT" for r in reasons
+    )
+    needs_input = has_proposed or (defect_flag and not has_applied)
+
+    reasons.sort(key=lambda r: r["excess"], reverse=True)
+
+    return {
+        "item_id": item_id,
+        "item_name": name,
+        "category": category,
+        "n": n,
+        "n_eff": round(float(n_eff), 2),
+        "reasons": reasons,
+        "overshoot": overshoot,
+        "max_excess": max_excess,
+        "top_flag": top_flag,
+        "recommendation": recommendation,
+        "needs_input": needs_input,
+        "defect_suspected": defect_suspected,
+        "defect_dimensions": defect_dimensions,
+        "defect_combined_share": defect_combined_share,
+    }
+
+
 @router.get("/item-insights")
 def list_item_insights(db: Session = Depends(get_db)):
     """
-    Per-item return-reason insights for the admin "Item insights" page.
+    CHEAP list for the admin "Item insights" page. Returns one lightweight row
+    per item that has qualifying returns — NO distribution / baseline / anomaly
+    computation. The expensive per-item analytics are computed lazily by
+    GET /item-insights/{item_id} only when the admin expands a row.
 
-    One object per item that has returns (n > 0). Composes the existing
-    insights engine (same calls / conventions as get_insight_detail):
-    item distribution, category/global baseline, and anomaly flags. Each
-    object carries the per-reason item vs. baseline shares, an overshoot
-    indicator, the latest recommendation (the "what change was made / when"
-    record), and whether admin input is needed.
+    Each row: {item_id, item_name, category, n}. A single GROUP BY over the
+    returns table (joined to order_items for the name) powers the whole list,
+    so the page loads instantly regardless of catalog size.
     """
-    rows = db.execute(
-        text("SELECT item_id, orderitem_product_name, category FROM order_items")
+    placeholders = ", ".join(f"'{s}'" for s in _RESOLVED_STATUSES)
+    # Aggregate on the returns table alone (grouping only by item_id so the
+    # planner can use ix_returns_status + ix_returns_item_id), take the top
+    # items by volume, then resolve names/categories in one small follow-up
+    # query. This avoids a 3-column GROUP BY join over the full 650k-row table.
+    count_rows = db.execute(
+        text(
+            f"""
+            SELECT r.item_id, COUNT(*) AS n
+            FROM returns r
+            WHERE r.item_id IS NOT NULL
+              AND r.last_return_status IN ({placeholders})
+              AND (r.fraud_flag = 0 OR r.fraud_flag IS NULL)
+            GROUP BY r.item_id
+            ORDER BY n DESC
+            LIMIT 200
+            """  # noqa: S608 - placeholders built from a constant tuple only
+        )
     ).fetchall()
 
-    results = []
-    for row in rows:
-        item_id, name, category = row
-        try:
-            item_dist = compute_item_distribution(item_id, db)
-            n = item_dist.get("n", 0)
-            if n == 0:
-                continue  # skip items with no returns
+    if not count_rows:
+        return []
 
-            n_eff = item_dist.get("n_eff", 0.0)
+    counts = {row[0]: int(row[1]) for row in count_rows}
+    ids = list(counts.keys())
+    id_placeholders = ", ".join(f":id{i}" for i in range(len(ids)))
+    params = {f"id{i}": iid for i, iid in enumerate(ids)}
+    name_rows = db.execute(
+        text(
+            f"""
+            SELECT item_id, orderitem_product_name, category
+            FROM order_items
+            WHERE item_id IN ({id_placeholders})
+              AND orderitem_product_name IS NOT NULL
+            """  # noqa: S608 - placeholders are bound parameters
+        ),
+        params,
+    ).fetchall()
+    names = {r[0]: (r[1], r[2]) for r in name_rows}
 
-            if category:
-                baseline = compute_category_baseline(category, db)
-            else:
-                baseline = compute_global_baseline(db)
-
-            # Union of reason codes present in the item distribution and baseline.
-            item_shares = {
-                k: float(v)
-                for k, v in item_dist.items()
-                if k not in _INSIGHT_META_KEYS
-            }
-            baseline_shares = {
-                k: float(v)
-                for k, v in baseline.items()
-                if k not in _INSIGHT_META_KEYS and isinstance(v, (int, float))
-            }
-            codes = set(item_shares) | set(baseline_shares)
-
-            # Match each reason to its FlagResult (when compute_anomaly produced one).
-            flags_raw = compute_anomaly(item_id, db)
-            flag_by_code = {f.reason_code: f for f in flags_raw}
-
-            reasons = []
-            for code in codes:
-                item_share = item_shares.get(code, 0.0)
-                baseline_share = baseline_shares.get(code, 0.0)
-                flag = flag_by_code.get(code)
-                if flag is not None:
-                    excess = flag.excess
-                    ratio = flag.ratio
-                    significant = flag.significant
-                else:
-                    excess = item_share - baseline_share
-                    ratio = item_share / max(baseline_share, 1e-9)
-                    significant = False
-                reasons.append(
-                    {
-                        "reason_code": code,
-                        "item_share": round(item_share, 4),
-                        "baseline_share": round(baseline_share, 4),
-                        "excess": round(excess, 4),
-                        "ratio": round(ratio, 4),
-                        "significant": significant,
-                    }
-                )
-
-            # overshoot = any significant reason whose excess clears flag_min_excess.
-            overshooting = [
-                r
-                for r in reasons
-                if r["significant"] and r["excess"] >= settings.flag_min_excess
-            ]
-            overshoot = len(overshooting) > 0
-
-            positive_excess = [r["excess"] for r in reasons if r["excess"] > 0]
-            max_excess = round(max(positive_excess), 4) if positive_excess else 0.0
-
-            top_flag = None
-            if overshoot:
-                worst = max(overshooting, key=lambda r: r["excess"])
-                top_flag = {
-                    "reason_code": worst["reason_code"],
-                    "group": code_to_group(worst["reason_code"]),
-                    "excess": worst["excess"],
-                    "ratio": worst["ratio"],
-                }
-
-            # Latest recommendation row (the "change made / when" record).
-            rec_row = db.execute(
-                text(
-                    "SELECT id, recommendation_type, reason_code, draft_text, "
-                    "confidence, status, created_at, updated_at "
-                    "FROM recommendations WHERE item_id = :iid "
-                    "ORDER BY updated_at DESC, id DESC LIMIT 1"
-                ),
-                {"iid": item_id},
-            ).fetchone()
-            recommendation = None
-            if rec_row is not None:
-                recommendation = {
-                    "id": rec_row[0],
-                    "recommendation_type": rec_row[1],
-                    "reason_code": rec_row[2],
-                    "draft_text": rec_row[3],
-                    "confidence": rec_row[4],
-                    "status": rec_row[5],
-                    "created_at": rec_row[6],
-                    "updated_at": rec_row[7],
-                }
-
-            # needs_input: a pending ('proposed') recommendation, OR a significant
-            # DEFECT-group flag with no applied recommendation yet.
-            has_proposed = recommendation is not None and recommendation["status"] == "proposed"
-            has_applied = recommendation is not None and recommendation["status"] == "applied"
-            defect_flag = any(
-                r["significant"] and code_to_group(r["reason_code"]) == "DEFECT"
-                for r in reasons
-            )
-            needs_input = has_proposed or (defect_flag and not has_applied)
-
-            # Sort reasons for a stable, readable chart (biggest deviation first).
-            reasons.sort(key=lambda r: r["excess"], reverse=True)
-
-            results.append(
-                {
-                    "item_id": item_id,
-                    "item_name": name,
-                    "category": category,
-                    "n": n,
-                    "n_eff": round(float(n_eff), 2),
-                    "reasons": reasons,
-                    "overshoot": overshoot,
-                    "max_excess": max_excess,
-                    "top_flag": top_flag,
-                    "recommendation": recommendation,
-                    "needs_input": needs_input,
-                }
-            )
-        except Exception:
-            continue
-
-    results.sort(
-        key=lambda x: (x["overshoot"], x["max_excess"], x["n"]),
-        reverse=True,
-    )
+    results = [
+        {
+            "item_id": iid,
+            "item_name": names[iid][0],
+            "category": names[iid][1],
+            "n": counts[iid],
+        }
+        for iid in ids
+        if iid in names
+    ]
+    results.sort(key=lambda x: x["n"], reverse=True)
     return results
+
+
+@router.get("/item-insights/{item_id}")
+def get_item_insight(item_id: str, db: Session = Depends(get_db)):
+    """
+    FULL return-reason analytics for ONE item (computed on demand when the admin
+    expands its row). Returns the same per-item shape the list used to embed:
+    reasons[], overshoot, max_excess, top_flag, recommendation, needs_input.
+    """
+    item_row = db.execute(
+        text(
+            "SELECT item_id, orderitem_product_name, category "
+            "FROM order_items WHERE item_id = :iid"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+    if not item_row:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    insight = _build_item_insight(item_row[0], item_row[1], item_row[2], db)
+    if insight is None:
+        raise HTTPException(status_code=404, detail="Item has no returns to analyse")
+    return insight
+
+
+# ---------------------------------------------------------------------------
+# 4c. POST /api/admin/items/{item_id}/delist — remove a defective product
+# ---------------------------------------------------------------------------
+
+
+@router.post("/items/{item_id}/delist")
+def delist_item(item_id: str, db: Session = Depends(get_db)):
+    """
+    Admin confirms removal of a product from the site (e.g. when it is
+    defect-suspected across all sizes). Records an 'applied' delist
+    recommendation and appends an AI activity-log note to the item's most
+    recent related case, if one exists.
+    """
+    item_row = db.execute(
+        text(
+            "SELECT item_id, orderitem_product_name, category "
+            "FROM order_items WHERE item_id = :iid"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+    if not item_row:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Pull the latest analysis to explain the removal and derive confidence.
+    insight = _build_item_insight(item_row[0], item_row[1], item_row[2], db)
+    defect_dimensions = insight.get("defect_dimensions", []) if insight else []
+    defect_combined_share = (
+        insight.get("defect_combined_share", 0.0) if insight else 0.0
+    )
+    confidence = float(defect_combined_share) if defect_combined_share else 0.5
+
+    if defect_dimensions:
+        dims_text = ", ".join(defect_dimensions)
+        draft_text = (
+            f"Remove {item_row[1]!r} from the site. The item is failing across "
+            f"multiple fit dimensions ({dims_text}), which points to a product "
+            f"defect rather than a one-off sizing issue. Combined share of the "
+            f"flagged dimensions is {defect_combined_share:.0%}."
+        )
+    else:
+        draft_text = (
+            f"Remove {item_row[1]!r} from the site based on its return profile."
+        )
+
+    now = datetime.utcnow()
+    db.execute(
+        text(
+            "INSERT INTO recommendations "
+            "(item_id, category, recommendation_type, reason_code, draft_text, "
+            " confidence, status, created_at, updated_at) "
+            "VALUES (:iid, :cat, 'delist', 'defect', :draft, :conf, 'applied', "
+            "        :now, :now)"
+        ),
+        {
+            "iid": item_id,
+            "cat": item_row[2],
+            "draft": draft_text,
+            "conf": round(confidence, 4),
+            "now": now,
+        },
+    )
+    db.commit()
+
+    # Append an AI log line to the item's most recent related case, if any.
+    case_row = db.execute(
+        text(
+            "SELECT id FROM cases WHERE item_id = :iid "
+            "ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+    if case_row is not None:
+        _append_ai_log(
+            case_row[0],
+            f"🗑️ Admin confirmed removal of {item_row[1]!r} from the site. "
+            "Logged as an applied delist recommendation (product flagged as "
+            "defective across multiple sizes).",
+            db,
+        )
+
+    return {"success": True, "item_id": item_id, "applied_at": now.isoformat()}
 
 
 # ---------------------------------------------------------------------------

@@ -169,6 +169,17 @@ export interface ItemInsight {
   top_flag: ItemInsightTopFlag | null;
   recommendation: ItemInsightRecommendation | null;
   needs_input: boolean;
+  defect_suspected: boolean;
+  defect_dimensions: string[];
+  defect_combined_share: number;
+}
+
+// Lightweight row for the Item insights LIST (no analytics computed server-side).
+export interface ItemInsightListEntry {
+  item_id: string;
+  item_name: string;
+  category: string | null;
+  n: number;
 }
 
 export interface ActivityEntry {
@@ -271,8 +282,19 @@ export const api = {
     return request(`/admin/insights/${encodeURIComponent(item_id)}`);
   },
 
-  getItemInsights(): Promise<ItemInsight[]> {
+  // Cheap list of items that have returns — no per-item analytics.
+  getItemInsightsList(): Promise<ItemInsightListEntry[]> {
     return request('/admin/item-insights');
+  },
+
+  // Full analytics for one item — computed on demand when a row is expanded.
+  getItemInsightDetail(itemId: string): Promise<ItemInsight> {
+    return request(`/admin/item-insights/${encodeURIComponent(itemId)}`);
+  },
+
+  // Remove a defect-suspected product from the site (admin confirmation).
+  delistItem(itemId: string): Promise<{ success: boolean; item_id: string; applied_at: string }> {
+    return request(`/admin/items/${encodeURIComponent(itemId)}/delist`, { method: 'POST' });
   },
 
   getRecommendations(): Promise<Recommendation[]> {
