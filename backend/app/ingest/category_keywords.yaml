@@ -1,0 +1,87 @@
+# category_keywords.yaml
+# Keyword rules for deriving product category from orderitem_product_name.
+# Matching is case-insensitive; first match wins (top-to-bottom).
+# Unmatched items fall through to the implicit "other" category.
+
+sneaker:
+  - sneaker
+  - trainer
+  - runner
+  - court
+  - athletic
+  - sport
+  - tennis
+  - canvas
+
+boot:
+  - boot
+  - bootie
+  - booties
+  - chelsea
+  - combat
+  - ankle boot
+  - winter boot
+
+sandal:
+  - sandal
+  - slide
+  - thong
+  - flip
+  - mule
+  - espadrille
+  - wedge sandal
+
+heel:
+  - heel
+  - pump
+  - stiletto
+  - kitten
+  - platform heel
+  - wedge heel
+  - slingback
+  - court heel
+
+flat:
+  - flat
+  - ballet
+  - pointed flat
+  - d orsay
+  - ballerina
+
+loafer:
+  - loafer
+  - moccasin
+  - penny
+  - driver
+  - slip on
+
+handbag:
+  - handbag
+  - bag
+  - tote
+  - clutch
+  - satchel
+  - crossbody
+  - shoulder bag
+  - backpack
+  - hobo
+  - wristlet
+  - purse
+
+wallet:
+  - wallet
+  - card holder
+  - cardholder
+  - bifold
+  - trifold
+  - billfold
+  - coin purse
+  - key fob
+
+sock:
+  - sock
+  - socks
+  - no-show
+  - ankle sock
+  - crew sock
+  - liner

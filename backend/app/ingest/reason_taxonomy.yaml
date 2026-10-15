@@ -1,0 +1,158 @@
+# reason_taxonomy.yaml
+# Maps raw `reason` values from OMS Data to (reason_code, canonical_reason).
+# Keys are lowercase-stripped versions of the raw reason string.
+# Groups: DEFECT | DESCRIPTION | FIT_SIZE | PREFERENCE | OTHER | FRAUD | UNKNOWN
+#
+# Source reference: docs/data_profile.md — "Distinct Values — reason" section.
+# This stub maps all 44 observed values documented in the data profile.
+
+mappings:
+  # ── Defect / Quality ──────────────────────────────────────────────────────
+  "defective":
+    code: DEFECT
+    canonical: Defective
+  "manufacturer defect":
+    code: DEFECT
+    canonical: Manufacturer Defect
+  "return.page.reasons.manufacturer defect":
+    code: DEFECT
+    canonical: Manufacturer Defect
+  "poor quality":
+    code: DEFECT
+    canonical: Poor Quality
+  "warranty":
+    code: DEFECT
+    canonical: Warranty
+
+  # ── Arrived damaged / wrong condition ─────────────────────────────────────
+  "arrived in poor condition":
+    code: DEFECT
+    canonical: Arrived in Poor Condition
+  "return.page.reasons.arrived in poor cond":
+    code: DEFECT
+    canonical: Arrived in Poor Condition
+
+  # ── Description / Expectation mismatch ───────────────────────────────────
+  "not as advertised":
+    code: DESCRIPTION
+    canonical: Not as Advertised
+  "not what i expected":
+    code: DESCRIPTION
+    canonical: Not What I Expected
+  "return.page.reasons.not what i expected":
+    code: DESCRIPTION
+    canonical: Not What I Expected
+  "return.page.reasons.ne répond pas aux at":
+    code: DESCRIPTION
+    canonical: Not What I Expected
+  "wrong item":
+    code: DESCRIPTION
+    canonical: Wrong Item
+  "wrong item delivered":
+    code: DESCRIPTION
+    canonical: Wrong Item Delivered
+  "return.page.reasons.wrong item delivered":
+    code: DESCRIPTION
+    canonical: Wrong Item Delivered
+  "wrong size delivered":
+    code: DESCRIPTION
+    canonical: Wrong Size Delivered
+  "return.page.reasons.wrong size delivered":
+    code: DESCRIPTION
+    canonical: Wrong Size Delivered
+
+  # ── Fit / Size ────────────────────────────────────────────────────────────
+  "too big":
+    code: FIT_SIZE
+    canonical: Too Big
+  "return.page.reasons.too big":
+    code: FIT_SIZE
+    canonical: Too Big
+  "return.page.reasons.trop grand":
+    code: FIT_SIZE
+    canonical: Too Big
+  "too small":
+    code: FIT_SIZE
+    canonical: Too Small
+  "return.page.reasons.too small":
+    code: FIT_SIZE
+    canonical: Too Small
+  "uncomfortable":
+    code: FIT_SIZE
+    canonical: Uncomfortable
+  "return.page.reasons.uncomfortable":
+    code: FIT_SIZE
+    canonical: Uncomfortable
+  # Note: "return.page.reasons.inconfortable" is mismapped in source data
+  # per data_profile.md — maps to FIT_SIZE, not Return Without Merchandise
+  "return.page.reasons.inconfortable":
+    code: FIT_SIZE
+    canonical: Uncomfortable
+
+  # ── Preference ────────────────────────────────────────────────────────────
+  "not satisfied with the colour":
+    code: PREFERENCE
+    canonical: Not Satisfied with the Colour
+  "found something else":
+    code: PREFERENCE
+    canonical: Found Something Else
+
+  # ── Other / Discretionary ─────────────────────────────────────────────────
+  "changed my mind / other":
+    code: OTHER
+    canonical: Changed My Mind / Other
+  "changed my mind / other":
+    code: OTHER
+    canonical: Changed My Mind / Other
+  "return.page.reasons.changed my mind / ot":
+    code: OTHER
+    canonical: Changed My Mind / Other
+  "return.page.reasons.j'ai changé d'idée /":
+    code: OTHER
+    canonical: Changed My Mind / Other
+  "changed idea":
+    code: OTHER
+    canonical: Changed My Mind / Other
+  "gift return":
+    code: OTHER
+    canonical: Gift Return
+  "arrived too late":
+    code: OTHER
+    canonical: Arrived Too Late
+  "return.page.reasons.arrived too late":
+    code: OTHER
+    canonical: Arrived Too Late
+  "return extension":
+    code: OTHER
+    canonical: Return Extension
+  "return extension":
+    code: OTHER
+    canonical: Return Extension
+
+  # ── Operational / Logistics ───────────────────────────────────────────────
+  "lost in transit":
+    code: FRAUD
+    canonical: Lost in Transit
+  "lost in transit":
+    code: FRAUD
+    canonical: Lost in Transit
+  "missing item":
+    code: FRAUD
+    canonical: Missing Item
+  "return to sender":
+    code: OTHER
+    canonical: Return to Sender
+  "return to sender":
+    code: OTHER
+    canonical: Return to Sender
+  "return without merchandise":
+    code: FRAUD
+    canonical: Return Without Merchandise
+  "return without merch":
+    code: FRAUD
+    canonical: Return Without Merchandise
+
+  # ── Unknown / Empty ───────────────────────────────────────────────────────
+  "":
+    code: UNKNOWN
+    canonical: Unknown
