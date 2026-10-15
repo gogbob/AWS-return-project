@@ -19,11 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from .db import Base, engine
 
 # ---------------------------------------------------------------------------
-# Router imports — add new routers here as submodules are implemented.
-# Each router module should expose a `router` attribute (APIRouter instance).
+# Router imports
 # ---------------------------------------------------------------------------
-# Example (uncomment as modules are built):
-# from .api import ingest, returns, insights, flags, triage, agent
+
+from .api.routes_customer import router as customer_router
+from .api.routes_admin import router as admin_router
 
 # ---------------------------------------------------------------------------
 # Lifespan: create DB tables on startup
@@ -45,12 +45,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="ALDO Returns Detective Agent",
-    description=(
-        "AI-powered return triage and analytics for ALDO Group retail brands "
-        "(ALDO, Call It Spring, Sperry)."
-    ),
-    version="0.1.0",
+    title="ALDO Returns Agent",
+    description="Demo returns system.",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -68,14 +65,11 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Router registration — uncomment each line as the router module is created.
+# Router registration
 # ---------------------------------------------------------------------------
-# app.include_router(ingest.router,   prefix="/api/ingest",   tags=["Ingest"])
-# app.include_router(returns.router,  prefix="/api/returns",  tags=["Returns"])
-# app.include_router(insights.router, prefix="/api/insights", tags=["Insights"])
-# app.include_router(flags.router,    prefix="/api/flags",    tags=["Flags"])
-# app.include_router(triage.router,   prefix="/api/triage",   tags=["Triage"])
-# app.include_router(agent.router,    prefix="/api/agent",    tags=["Agent"])
+
+app.include_router(customer_router)
+app.include_router(admin_router)
 
 
 # ---------------------------------------------------------------------------
