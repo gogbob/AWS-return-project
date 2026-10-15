@@ -1,9 +1,21 @@
 data/raw/*
 
-# SQLite database (regenerated from ingestion)
+# SQLite database (regenerated from ingestion) + WAL/SHM sidecar files
 backend/aldo_returns.db
 backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
 # Environment / secrets — never commit credentials
 .env
 *.env
 backend/.env
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Agent task artifacts
+.agents/
+backend/.agents/
