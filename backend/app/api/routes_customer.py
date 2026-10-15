@@ -173,6 +173,76 @@ def get_product(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# 2b. GET /api/product/{item_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/product/{item_id}", tags=["Customer"])
+def get_product_detail(item_id: str, db: Session = Depends(get_db)):
+    """
+    Return customer-facing detail for a single product, including any applied
+    AI listing change so the customer can see the updated guidance.
+
+    NEVER includes loyalty, suspicion, or fraud fields.
+    """
+    item_row = db.execute(
+        text(
+            "SELECT item_id, orderitem_product_name, category "
+            "FROM order_items WHERE item_id = :iid"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+
+    if not item_row:
+        raise HTTPException(status_code=404, detail=f"Item {item_id!r} not found")
+
+    # Derive a rough price from the most recent refund_amount for this item.
+    price_row = db.execute(
+        text(
+            "SELECT refund_amount FROM returns "
+            "WHERE item_id = :iid AND refund_amount IS NOT NULL "
+            "ORDER BY return_creation_date DESC LIMIT 1"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+    price: Optional[float] = float(price_row[0]) if price_row else None
+
+    # Static fallback description (no description column exists).
+    description = (
+        "Crafted with premium materials and designed for everyday comfort, this "
+        "style pairs effortlessly with any wardrobe. A ALDO signature silhouette "
+        "with a timeless finish."
+    )
+
+    # Latest APPLIED recommendation → listing_change (else null).
+    rec_row = db.execute(
+        text(
+            "SELECT recommendation_type, draft_text, updated_at FROM recommendations "
+            "WHERE item_id = :iid AND status = 'applied' "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ),
+        {"iid": item_id},
+    ).fetchone()
+
+    listing_change: Optional[dict] = None
+    if rec_row is not None:
+        listing_change = {
+            "recommendation_type": rec_row[0],
+            "draft_text": rec_row[1],
+            "updated_at": rec_row[2],
+        }
+
+    return {
+        "item_id": item_row[0],
+        "item_name": item_row[1],
+        "price": price,
+        "category": item_row[2],
+        "description": description,
+        "listing_change": listing_change,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 3. GET /api/items/search
 # ---------------------------------------------------------------------------
 

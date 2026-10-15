@@ -32,6 +32,19 @@ export interface OrderItem {
   item_name: string;
 }
 
+export interface ProductDetail {
+  item_id: string;
+  item_name: string;
+  price: number | null;
+  category: string | null;
+  description: string;
+  listing_change: {
+    recommendation_type: string | null;
+    draft_text: string | null;
+    updated_at: string | null;
+  } | null;
+}
+
 export interface Store {
   name: string;
   address: string;
@@ -206,6 +219,10 @@ export const api = {
 
   getProduct(): Promise<ProductInfo> {
     return request('/product');
+  },
+
+  getProductDetail(itemId: string): Promise<ProductDetail> {
+    return request(`/product/${encodeURIComponent(itemId)}`);
   },
 
   searchItems(customer_id: string, q: string): Promise<OrderItem[]> {
