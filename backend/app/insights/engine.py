@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from scipy.stats import binom_test  # type: ignore[import-untyped]
+try:
+    from scipy.stats import binom_test  # type: ignore[import-untyped]  # scipy < 1.11
+except ImportError:  # scipy >= 1.11 renamed binom_test → binomtest
+    from scipy.stats import binomtest as _binomtest  # type: ignore[import-untyped]
+
+    def binom_test(k: int, n: int, p: float, alternative: str = "greater") -> float:  # type: ignore[misc]
+        """Shim: delegate to scipy.stats.binomtest (scipy >= 1.11)."""
+        return _binomtest(k, n, p, alternative=alternative).pvalue
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
