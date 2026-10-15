@@ -112,7 +112,7 @@ _WEIGHT_SQL = """
             r.id,
             r.item_id,
             r.customer_uid,
-            r.reason_code,
+            r.reason,
             r.refund_amount,
             r.return_creation_date,
             COALESCE(c.loyalty, 0) AS loyalty,
@@ -129,7 +129,7 @@ _WEIGHT_SQL = """
           AND r.item_id = :item_id
     )
     SELECT
-        reason_code,
+        reason,
         loyalty,
         (0.5 + CAST(loyalty AS REAL) / 100.0) AS weight
     FROM ranked
@@ -138,9 +138,14 @@ _WEIGHT_SQL = """
 
 
 def _item_evidence(item_id: str, db: Session) -> list[dict]:
-    """Return one row per customer (most recent return) for the given item."""
+    """Return one row per customer (most recent return) for the given item.
+
+    The raw ``reason`` text is mapped through ``reason_to_code`` so that
+    distributions use fine-grained codes (too_small, too_big, …) rather than
+    the coarse GROUP names stored in ``returns.reason_code``.
+    """
     rows = db.execute(text(_WEIGHT_SQL), {"item_id": item_id}).fetchall()
-    return [{"reason_code": r[0] or "other", "loyalty": r[1], "weight": r[2]} for r in rows]
+    return [{"reason_code": reason_to_code(r[0]), "loyalty": r[1], "weight": r[2]} for r in rows]
 
 
 _CATEGORY_EVIDENCE_SQL = """
@@ -176,7 +181,7 @@ def _global_evidence(db: Session) -> list[dict]:
             SELECT
                 r.item_id,
                 r.customer_uid,
-                r.reason_code,
+                r.reason,
                 COALESCE(c.loyalty, 0) AS loyalty,
                 ROW_NUMBER() OVER (
                     PARTITION BY r.item_id, r.customer_uid
@@ -188,11 +193,11 @@ def _global_evidence(db: Session) -> list[dict]:
               AND (r.fraud_flag = 0 OR r.fraud_flag IS NULL)
               AND COALESCE(c.fraud_flag, 0) = 0
         )
-        SELECT reason_code, loyalty, (0.5 + CAST(loyalty AS REAL) / 100.0) AS weight
+        SELECT reason, loyalty, (0.5 + CAST(loyalty AS REAL) / 100.0) AS weight
         FROM ranked WHERE rn = 1
     """
     rows = db.execute(text(sql)).fetchall()
-    return [{"reason_code": r[0] or "other", "loyalty": r[1], "weight": r[2]} for r in rows]
+    return [{"reason_code": reason_to_code(r[0]), "loyalty": r[1], "weight": r[2]} for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -269,42 +274,101 @@ def _qualifying_items_in_category(category: str, db: Session) -> list[str]:
     return [r[0] for r in rows]
 
 
+# Per-category baseline cache (baselines are static for a given dataset; the
+# admin page only reads them). Keyed by category name; cleared when returns
+# change via invalidate_baseline_cache().
+_BASELINE_CACHE: dict[str, dict] = {}
+
+
+def invalidate_baseline_cache() -> None:
+    """Clear memoized category/global baselines (call after returns change)."""
+    _BASELINE_CACHE.clear()
+
+
+# One query returns the per-(item, reason) weighted totals for an ENTIRE
+# category, so we never issue one query per item (the old N+1 that made the
+# large "other" category take minutes). The customer-loyalty weight
+# (0.5 + loyalty/100) is applied in SQL, matching _weighted_distribution.
+_CATEGORY_WEIGHTED_SQL = """
+    WITH ranked AS (
+        SELECT
+            r.item_id,
+            r.customer_uid,
+            r.reason,
+            COALESCE(c.loyalty, 0) AS loyalty,
+            ROW_NUMBER() OVER (
+                PARTITION BY r.item_id, r.customer_uid
+                ORDER BY r.return_creation_date DESC
+            ) AS rn
+        FROM returns r
+        LEFT JOIN customers c ON c.customer_id = r.customer_uid
+        LEFT JOIN order_items oi ON oi.item_id = r.item_id
+        WHERE r.last_return_status IN ('RETURN_COMPLETED','RETURN_RECEIVED','RETURN_PROCESSED')
+          AND (r.fraud_flag = 0 OR r.fraud_flag IS NULL)
+          AND COALESCE(c.fraud_flag, 0) = 0
+          AND oi.category = :category
+    )
+    SELECT
+        item_id,
+        reason,
+        SUM(0.5 + CAST(loyalty AS REAL) / 100.0) AS weight
+    FROM ranked
+    WHERE rn = 1
+    GROUP BY item_id, reason
+"""
+
+
 def compute_category_baseline(category: str, db: Session) -> dict:
     """
-    Compute per-reason-code median share across all qualifying items in
-    the category, then renormalise so shares sum to 1.
+    Per-reason-code median share across all qualifying items in the category,
+    renormalised to sum to 1. Result is memoized per category.
 
     Returns: {reason_code: median_share, 'n_items': count, 'scope': 'category'}
     """
-    qualifying = _qualifying_items_in_category(category, db)
+    if category in _BASELINE_CACHE:
+        return dict(_BASELINE_CACHE[category])
+
+    qualifying = set(_qualifying_items_in_category(category, db))
 
     if len(qualifying) < 10:
-        # Fall back to global baseline
         result = compute_global_baseline(db)
         result["scope"] = "global"
         result["n_items"] = len(qualifying)
+        _BASELINE_CACHE[category] = dict(result)
         return result
 
-    # Collect per-item distributions
+    # Pull the whole category's per-item weighted reason totals in ONE query,
+    # then build each qualifying item's share vector in Python (no per-item SQL).
+    rows = db.execute(text(_CATEGORY_WEIGHTED_SQL), {"category": category}).fetchall()
+
+    # Accumulate weights per (item_id, granular_code) in Python — the raw
+    # reason is mapped through reason_to_code() so share vectors use the
+    # fine-grained codes rather than the coarse GROUP names.
+    totals_by_item: dict[str, dict[str, float]] = {}
+    for item_id, reason, weight in rows:
+        if item_id not in qualifying:
+            continue
+        code = reason_to_code(reason)
+        item_totals = totals_by_item.setdefault(item_id, {})
+        item_totals[code] = item_totals.get(code, 0.0) + float(weight)
+
     item_shares: list[dict[str, float]] = []
-    for item_id in qualifying:
-        evidence = _item_evidence(item_id, db)
-        shares, n, _ = _weighted_distribution(evidence)
-        if n > 0:
-            item_shares.append(shares)
+    for totals in totals_by_item.values():
+        total_w = sum(totals.values())
+        if total_w > 0:
+            item_shares.append({code: w / total_w for code, w in totals.items()})
 
     if not item_shares:
         result = compute_global_baseline(db)
         result["scope"] = "global"
         result["n_items"] = 0
+        _BASELINE_CACHE[category] = dict(result)
         return result
 
-    # Gather all codes
     all_codes = set()
     for s in item_shares:
         all_codes.update(s.keys())
 
-    # Compute median share per code (treat missing as 0)
     import statistics
 
     medians: dict[str, float] = {}
@@ -312,13 +376,13 @@ def compute_category_baseline(category: str, db: Session) -> dict:
         vals = [s.get(code, 0.0) for s in item_shares]
         medians[code] = statistics.median(vals)
 
-    # Renormalise
     total = sum(medians.values())
     if total > 0:
         medians = {code: v / total for code, v in medians.items()}
 
     medians["n_items"] = len(item_shares)
     medians["scope"] = "category"
+    _BASELINE_CACHE[category] = dict(medians)
     return medians
 
 
@@ -330,15 +394,21 @@ def compute_category_baseline(category: str, db: Session) -> dict:
 def compute_global_baseline(db: Session) -> dict:
     """
     Compute weighted reason-code distribution across all qualifying evidence.
+    Memoized (keyed under "__global__" in the baseline cache).
 
     Returns: {reason_code: share, 'n': count, 'n_eff': n_eff, 'scope': 'global'}
     """
+    cached = _BASELINE_CACHE.get("__global__")
+    if cached is not None:
+        return dict(cached)
+
     evidence = _global_evidence(db)
     shares, n, n_eff = _weighted_distribution(evidence)
     result = dict(shares)
     result["n"] = n
     result["n_eff"] = n_eff
     result["scope"] = "global"
+    _BASELINE_CACHE["__global__"] = dict(result)
     return result
 
 
