@@ -1,12 +1,15 @@
 import { useState } from 'react';
 import CaseQueue from '../components/admin/CaseQueue';
 import InsightsTable from '../components/admin/InsightsTable';
+import ItemInsights from '../components/admin/ItemInsights';
 import RecommendationsTable from '../components/admin/RecommendationsTable';
 import DataHealth from '../components/admin/DataHealth';
+import ActivityLog from '../components/admin/ActivityLog';
 
-type Tab = 'queue' | 'insights' | 'recommendations' | 'health';
+type Tab = 'activity' | 'queue' | 'insights' | 'recommendations' | 'health';
 
 const TABS: { key: Tab; label: string }[] = [
+  { key: 'activity', label: 'Activity log' },
   { key: 'queue', label: 'Review queue' },
   { key: 'insights', label: 'Insights' },
   { key: 'recommendations', label: 'Recommendations' },
@@ -14,7 +17,7 @@ const TABS: { key: Tab; label: string }[] = [
 ];
 
 export default function AdminPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('queue');
+  const [activeTab, setActiveTab] = useState<Tab>('activity');
 
   return (
     <div className="min-h-screen bg-white text-black font-[system-ui,Inter,sans-serif]">
@@ -52,6 +55,7 @@ export default function AdminPage() {
         </div>
 
         {/* Tab content */}
+        {activeTab === 'activity' && <ActivityLog />}
         {activeTab === 'queue' && <CaseQueue />}
         {activeTab === 'insights' && <InsightsTable />}
         {activeTab === 'recommendations' && <RecommendationsTable />}

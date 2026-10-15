@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, DemoCustomer } from '../api/client';
 import { useCustomer } from '../context/CustomerContext';
+import { useBag } from '../context/BagContext';
+import BagPanel from './BagPanel';
 
 interface HeaderProps {
   onReturnClick: () => void;
@@ -9,12 +11,14 @@ interface HeaderProps {
 export default function Header({ onReturnClick }: HeaderProps) {
   const [customers, setCustomers] = useState<DemoCustomer[]>([]);
   const { customerId, setCustomerId } = useCustomer();
+  const { count } = useBag();
+  const [bagOpen, setBagOpen] = useState(false);
 
   useEffect(() => {
     api.getDemoCustomers().then((list) => {
       setCustomers(list);
       if (!customerId && list.length > 0) {
-        setCustomerId(list[0].customer_id);
+        setCustomerId(list[0].id);
       }
     });
   }, []);
@@ -37,11 +41,11 @@ export default function Header({ onReturnClick }: HeaderProps) {
           >
             {customers.map((c) => (
               <option
-                key={c.customer_id}
-                value={c.customer_id}
+                key={c.id}
+                value={c.id}
                 title={
-                  import.meta.env.DEV && c.loyalty != null
-                    ? `Loyalty: ${c.loyalty}`
+                  import.meta.env.DEV && c.loyalty_dev != null
+                    ? `Loyalty: ${c.loyalty_dev}`
                     : undefined
                 }
               >
@@ -59,7 +63,24 @@ export default function Header({ onReturnClick }: HeaderProps) {
         >
           Return an item
         </button>
+
+        {/* Bag button */}
+        <button
+          onClick={() => setBagOpen(true)}
+          aria-label={`Open bag, ${count} item${count === 1 ? '' : 's'}`}
+          className="relative flex items-center gap-2 border border-gray-300 px-3 py-2 text-sm font-medium uppercase tracking-wider text-black hover:bg-gray-50 transition-colors"
+        >
+          <span aria-hidden="true">🛍️</span>
+          Bag
+          {count > 0 && (
+            <span className="absolute -top-2 -right-2 bg-black text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+              {count}
+            </span>
+          )}
+        </button>
       </div>
+
+      {bagOpen && <BagPanel onClose={() => setBagOpen(false)} />}
     </header>
   );
 }

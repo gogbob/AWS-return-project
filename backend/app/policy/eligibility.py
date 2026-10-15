@@ -103,13 +103,16 @@ def check_eligibility(
     ).fetchone()
 
     if existing_return is None:
-        # Also check the cases table for an open or resolved case
+        # Also check the cases table for an already-resolved return. We only
+        # block on terminally-resolved cases (approved); a lingering PENDING
+        # case is not a hard block, so a customer can restart an abandoned
+        # return flow for the same item.
         existing_case = db.execute(
             text(
                 "SELECT id FROM cases "
                 "WHERE order_number = :order_number "
                 "  AND sku = :sku "
-                "  AND status NOT IN ('rejected', 'cancelled') "
+                "  AND status IN ('APPROVED_NO_FEE', 'APPROVED_WITH_FEE') "
                 "LIMIT 1"
             ),
             {"order_number": order_number, "sku": sku},
@@ -117,7 +120,7 @@ def check_eligibility(
         if existing_case:
             return EligibilityResult(
                 eligible=False,
-                reason="A return request already exists for this item.",
+                reason="This item has already been returned.",
                 is_final_sale=False,
             )
 

@@ -2,13 +2,18 @@ import { useEffect, useState } from 'react';
 import { api, ProductInfo } from '../api/client';
 import Header from '../components/Header';
 import ReturnModal from '../components/ReturnModal';
+import { useBag } from '../context/BagContext';
 
 const SIZES = ['6', '7', '8', '9', '10', '11'];
+const PRICE = 149.95;
 
 export default function ProductPage() {
   const [product, setProduct] = useState<ProductInfo | null>(null);
   const [selectedSize, setSelectedSize] = useState('');
   const [showModal, setShowModal] = useState(false);
+  const [addNotice, setAddNotice] = useState('');
+  const [sizeError, setSizeError] = useState(false);
+  const { addItem } = useBag();
 
   useEffect(() => {
     api.getProduct().then(setProduct).catch(() => {
@@ -16,6 +21,18 @@ export default function ProductPage() {
       setProduct({ item_name: 'ALDO Demo Shoe' });
     });
   }, []);
+
+  function handleAddToBag() {
+    if (!selectedSize) {
+      setSizeError(true);
+      setAddNotice('');
+      return;
+    }
+    setSizeError(false);
+    const name = product?.item_name ?? 'ALDO Demo Shoe';
+    addItem({ item_name: name, size: selectedSize, price: PRICE });
+    setAddNotice(`Added ${name} (size ${selectedSize}) to your bag.`);
+  }
 
   return (
     <div className="min-h-screen bg-white text-black font-[system-ui,Inter,sans-serif]">
@@ -38,7 +55,7 @@ export default function ProductPage() {
             <h1 className="text-2xl font-semibold tracking-tight text-black uppercase">
               {product?.item_name ?? 'Loading…'}
             </h1>
-            <p className="text-xl mt-1 text-black font-light">$149.95</p>
+            <p className="text-xl mt-1 text-black font-light">${PRICE.toFixed(2)}</p>
           </div>
 
           {/* Size guidance banner */}
@@ -57,7 +74,10 @@ export default function ProductPage() {
               {SIZES.map((size) => (
                 <button
                   key={size}
-                  onClick={() => setSelectedSize(size)}
+                  onClick={() => {
+                    setSelectedSize(size);
+                    setSizeError(false);
+                  }}
                   className={`w-12 h-12 border text-sm font-medium transition-colors ${
                     selectedSize === size
                       ? 'border-black bg-black text-white'
@@ -68,6 +88,9 @@ export default function ProductPage() {
                 </button>
               ))}
             </div>
+            {sizeError && (
+              <p className="text-sm text-red-600 mt-2">Please select a size first.</p>
+            )}
           </div>
 
           {/* Description */}
@@ -76,10 +99,23 @@ export default function ProductPage() {
             effortlessly with any wardrobe. A ALDO signature silhouette with a timeless finish.
           </p>
 
-          {/* Add to bag placeholder */}
-          <button className="w-full md:max-w-xs bg-black text-white py-3 text-sm font-medium uppercase tracking-wider hover:bg-gray-800 transition-colors">
+          {/* Add to bag */}
+          <button
+            onClick={handleAddToBag}
+            className="w-full md:max-w-xs bg-black text-white py-3 text-sm font-medium uppercase tracking-wider hover:bg-gray-800 transition-colors"
+          >
             Add to bag
           </button>
+
+          {addNotice && (
+            <div
+              role="status"
+              className="md:max-w-xs flex items-start gap-2 rounded border border-green-300 bg-green-50 px-4 py-2 text-sm text-green-800"
+            >
+              <span aria-hidden="true" className="font-bold">✓</span>
+              <span>{addNotice}</span>
+            </div>
+          )}
         </div>
       </main>
 

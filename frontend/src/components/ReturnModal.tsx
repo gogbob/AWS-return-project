@@ -28,6 +28,7 @@ export default function ReturnModal({ onClose }: ReturnModalProps) {
   const [caseId, setCaseId] = useState('');
   const [initialMessage, setInitialMessage] = useState('');
   const [initialState, setInitialState] = useState('');
+  const [confirmation, setConfirmation] = useState('');
 
   function stepIndex(): number {
     if (step === 'item') return 0;
@@ -93,6 +94,17 @@ export default function ReturnModal({ onClose }: ReturnModalProps) {
           </div>
         )}
 
+        {/* Confirmation banner */}
+        {confirmation && (
+          <div
+            role="status"
+            className="mx-6 mt-3 flex items-start gap-2 rounded border border-green-300 bg-green-50 px-4 py-2 text-sm text-green-800"
+          >
+            <span aria-hidden="true" className="font-bold">✓</span>
+            <span>{confirmation}</span>
+          </div>
+        )}
+
         {/* Step content */}
         <div className={`px-6 py-5 overflow-y-auto ${step === 'chat' ? 'flex-1 flex flex-col' : ''}`}>
           {step === 'item' && (
@@ -100,6 +112,7 @@ export default function ReturnModal({ onClose }: ReturnModalProps) {
               customerId={customerId}
               onSelect={(item) => {
                 setSelectedItem(item);
+                setConfirmation(`${item.item_name} selected for return (Order #${item.order_number}).`);
                 setStep('method');
               }}
             />
@@ -137,6 +150,7 @@ export default function ReturnModal({ onClose }: ReturnModalProps) {
                 setCaseId(id);
                 setInitialMessage(msg);
                 setInitialState(s);
+                setConfirmation(`Return request confirmed for ${selectedItem.item_name}.`);
                 setStep('chat');
               }}
               onFinalSale={() => setStep('final_sale')}

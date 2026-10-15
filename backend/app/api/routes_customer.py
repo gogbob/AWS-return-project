@@ -37,16 +37,16 @@ router = APIRouter()
 # Loyalty is internal-only and NEVER sent to the customer UI.
 # ---------------------------------------------------------------------------
 
+# Two demo customers mapped to real customer_uid values in the dataset so the
+# returnable-item list reflects actual order history. The public-facing "id"
+# is a stable synthetic key; `uid` is what the data layer filters on.
 _DEMO_CUSTOMERS: list[dict] = [
-    {"id": "CUST-001", "label": "Customer #1", "_loyalty": 95},  # high
-    {"id": "CUST-002", "label": "Customer #2", "_loyalty": 82},  # high
-    {"id": "CUST-003", "label": "Customer #3", "_loyalty": 71},  # high
-    {"id": "CUST-004", "label": "Customer #4", "_loyalty": 55},  # medium
-    {"id": "CUST-005", "label": "Customer #5", "_loyalty": 48},  # medium
-    {"id": "CUST-006", "label": "Customer #6", "_loyalty": 25},  # low
-    {"id": "CUST-007", "label": "Customer #7", "_loyalty": 12},  # low
-    {"id": "CUST-008", "label": "Customer #8", "_loyalty": 5},   # low
+    {"id": "CUST-LOYAL", "uid": "SID:10005372135022", "label": "Loyal Customer", "_loyalty": 95},    # high loyalty
+    {"id": "CUST-UNLOYAL", "uid": "SID:102909224525987", "label": "Unloyal Customer", "_loyalty": 8},  # low loyalty
 ]
+
+# Map public demo id -> real customer_uid for the data layer.
+_DEMO_UID_BY_ID: dict[str, str] = {c["id"]: c["uid"] for c in _DEMO_CUSTOMERS}
 
 # Map label → customer index for fast admin lookup (used by admin routes too)
 CUSTOMER_LABEL_MAP: dict[str, int] = {c["id"]: i + 1 for i, c in enumerate(_DEMO_CUSTOMERS)}
@@ -97,17 +97,23 @@ def get_product(db: Session = Depends(get_db)):
 
     if not item_id:
         # Most evidence-eligible returns = most distinct customers with
-        # completed/received/processed returns
+        # completed/received/processed returns. Prefer clean style names
+        # (skip internal variant codes like "..._mm" / "..._wm").
         row = db.execute(
             text(
                 """
                 SELECT r.item_id
                 FROM returns r
+                JOIN order_items oi ON oi.item_id = r.item_id
                 WHERE r.last_return_status IN (
                     'RETURN_COMPLETED','RETURN_RECEIVED','RETURN_PROCESSED'
                 )
                   AND (r.fraud_flag = 0 OR r.fraud_flag IS NULL)
                   AND r.item_id IS NOT NULL
+                  AND oi.orderitem_product_name IS NOT NULL
+                  AND oi.orderitem_product_name NOT LIKE '%\\_mm' ESCAPE '\\'
+                  AND oi.orderitem_product_name NOT LIKE '%\\_wm' ESCAPE '\\'
+                  AND oi.orderitem_product_name NOT GLOB '*[0-9]*'
                 GROUP BY r.item_id
                 ORDER BY COUNT(DISTINCT r.customer_uid) DESC
                 LIMIT 1
@@ -157,7 +163,7 @@ def get_product(db: Session = Depends(get_db)):
 
     return {
         "item_id": item_row[0],
-        "name": item_row[1],
+        "item_name": item_row[1],
         "price": price,
         "category": item_row[2],
         "size_guidance_banner": size_guidance_banner,
@@ -170,13 +176,22 @@ def get_product(db: Session = Depends(get_db)):
 
 
 @router.get("/api/items/search", tags=["Customer"])
-def search_items(customer_id: str, q: str, db: Session = Depends(get_db)):
+def search_items(customer_id: str, q: str = "", db: Session = Depends(get_db)):
     """
-    Fuzzy search this customer's order items.
-    Returns [{order_number, sku, item_id, name, score}].
+    List or fuzzy-search this customer's order items.
+
+    When `q` is empty, returns ALL of the customer's returnable items so the
+    UI can show them without requiring a search. When `q` is provided, results
+    are filtered by fuzzy match on the product name.
+
+    Returns [{order_number, sku, item_id, item_name, score}].
     NEVER includes loyalty.
     """
     from rapidfuzz import fuzz
+
+    # Demo ids map to a real customer_uid; fall back to the raw value so a
+    # real uid passed directly still works.
+    resolved_uid = _DEMO_UID_BY_ID.get(customer_id, customer_id)
 
     rows = db.execute(
         text(
@@ -192,10 +207,11 @@ def search_items(customer_id: str, q: str, db: Session = Depends(get_db)):
               AND oi.orderitem_product_name IS NOT NULL
             """
         ),
-        {"cid": customer_id},
+        {"cid": resolved_uid},
     ).fetchall()
 
-    query_lower = q.lower()
+    query_lower = q.strip().lower()
+    show_all = query_lower == ""
     results = []
     seen: set[tuple] = set()
     for row in rows:
@@ -204,20 +220,108 @@ def search_items(customer_id: str, q: str, db: Session = Depends(get_db)):
             continue
         seen.add(key)
         name = (row[3] or "").lower()
-        score = fuzz.token_set_ratio(query_lower, name)
-        if score >= 60:
+        score = 100.0 if show_all else float(fuzz.token_set_ratio(query_lower, name))
+        if show_all or score >= 60:
             results.append(
                 {
                     "order_number": row[0],
                     "sku": row[1],
                     "item_id": row[2],
-                    "name": row[3],
+                    "item_name": row[3],
                     "score": score,
                 }
             )
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    if show_all:
+        results.sort(key=lambda x: (x["item_name"] or "").lower())
+    else:
+        results.sort(key=lambda x: x["score"], reverse=True)
     return results
+
+
+# ---------------------------------------------------------------------------
+# 3b. POST /api/checkout — record purchased items so they become returnable
+# ---------------------------------------------------------------------------
+
+
+class CheckoutItem(BaseModel):
+    item_name: str
+    size: str
+    price: float
+
+
+class CheckoutRequest(BaseModel):
+    customer_id: str
+    items: list[CheckoutItem]
+
+
+@router.post("/api/checkout", tags=["Customer"])
+def checkout(body: CheckoutRequest, db: Session = Depends(get_db)):
+    """
+    Record a purchase for the current demo customer.
+
+    For each bag item we ensure an `order_items` row exists and insert a
+    `returns` row with status 'PURCHASED' (source 'checkout'). This makes the
+    item show up in the customer's returnable list and pass eligibility — the
+    'PURCHASED' status is deliberately NOT one of the active-return statuses,
+    so the return flow treats it as a fresh, un-returned purchase.
+    """
+    if not body.items:
+        raise HTTPException(status_code=400, detail="Bag is empty.")
+
+    resolved_uid = _DEMO_UID_BY_ID.get(body.customer_id, body.customer_id)
+
+    order_number = f"WEB-{uuid.uuid4().hex[:10].upper()}"
+    created = []
+
+    for idx, item in enumerate(body.items):
+        item_id = item.item_name
+        # Unique sku per line so multiple sizes don't collide.
+        sku = f"CO-{uuid.uuid4().hex[:8].upper()}"
+
+        # Ensure an order_items row exists for this product.
+        exists = db.execute(
+            text("SELECT 1 FROM order_items WHERE item_id = :iid LIMIT 1"),
+            {"iid": item_id},
+        ).fetchone()
+        if not exists:
+            db.execute(
+                text(
+                    "INSERT INTO order_items "
+                    "(item_id, sku, orderitem_product_name, category, store_banner) "
+                    "VALUES (:iid, :sku, :name, 'other', 'ALDO')"
+                ),
+                {"iid": item_id, "sku": sku, "name": item.item_name},
+            )
+
+        # Insert a purchase row in `returns` (status PURCHASED => returnable).
+        db.execute(
+            text(
+                "INSERT INTO returns "
+                "(order_number, sku, item_id, customer_uid, return_creation_date, "
+                " last_return_status, refund_amount, item_return_qty, source, fraud_flag) "
+                "VALUES (:on, :sku, :iid, :cid, :now, 'PURCHASED', :price, 1, 'checkout', 0)"
+            ),
+            {
+                "on": order_number,
+                "sku": sku,
+                "iid": item_id,
+                "cid": resolved_uid,
+                "now": datetime.utcnow(),
+                "price": item.price,
+            },
+        )
+        created.append(
+            {
+                "order_number": order_number,
+                "sku": sku,
+                "item_id": item_id,
+                "item_name": item.item_name,
+            }
+        )
+
+    db.commit()
+    return {"order_number": order_number, "items": created}
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +378,78 @@ def nearest_stores(lat: float, lng: float, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# AI activity-log helpers (admin console)
+# ---------------------------------------------------------------------------
+
+
+def _append_ai_log(case_id: str, content: str, db: Session) -> None:
+    """Append a line to the AI activity log for a case (role='ai_log')."""
+    db.execute(
+        text(
+            "INSERT INTO case_messages (case_id, role, content, created_at) "
+            "VALUES (:cid, 'ai_log', :content, :now)"
+        ),
+        {"cid": case_id, "content": content, "now": datetime.utcnow()},
+    )
+    db.commit()
+
+
+def _log_triage_decision(case_id: str, db: Session) -> None:
+    """
+    Run triage for a freshly-created case and record the AI's shipping-fee
+    decision (and reasoning) to the admin activity log. On a review outcome,
+    log that the AI is requesting human input on what to tell the customer.
+    """
+    try:
+        result = compute_triage(case_id, db)
+    except Exception as exc:  # pragma: no cover - defensive
+        _append_ai_log(case_id, f"⚠️ Triage failed to run: {exc}", db)
+        return
+
+    bd = result.breakdown or {}
+    loyalty_c = bd.get("loyalty_component", 0.0)
+    implaus_c = bd.get("implausibility_component", 0.0)
+    claim_c = bd.get("claim_risk_component", 0.0)
+
+    # Pick the dominant reason driver for a plain-English explanation.
+    drivers = {
+        "customer loyalty": loyalty_c,
+        "believability of the reason": implaus_c + claim_c,
+    }
+    main_driver = max(drivers, key=drivers.get) if any(drivers.values()) else "customer loyalty"
+
+    outcome = result.outcome.value
+
+    if outcome == "APPROVED_NO_FEE":
+        _append_ai_log(
+            case_id,
+            "✅ Decision: APPROVE with FREE shipping (no fee). "
+            f"Reason: strong {main_driver}. "
+            "The customer qualifies for a no-cost return.",
+            db,
+        )
+    elif outcome == "APPROVED_WITH_FEE":
+        _append_ai_log(
+            case_id,
+            f"💲 Decision: APPROVE with a reduced-cost return "
+            f"(${result.fee:.2f} shipping fee). "
+            f"Reason: moderate risk based on {main_driver}. "
+            "Free shipping not granted.",
+            db,
+        )
+    else:
+        # VISION_REVIEW / HUMAN_REVIEW — the AI needs a human to weigh in.
+        _append_ai_log(
+            case_id,
+            f"🙋 Needs human input (suspicion {result.suspicion:.2f}). "
+            f"The AI is unsure based on {main_driver} and is asking the admin: "
+            "should the customer be offered free shipping, a reduced-cost return, "
+            "or a rejection? Use the decision buttons below to tell the AI what to do.",
+            db,
+        )
+
+
+# ---------------------------------------------------------------------------
 # 5. POST /api/returns/start
 # ---------------------------------------------------------------------------
 
@@ -283,7 +459,7 @@ class StartReturnRequest(BaseModel):
     order_number: str
     sku: str
     item_id: str
-    reason_code: str
+    reason: str
 
 
 @router.post("/api/returns/start", tags=["Customer"])
@@ -292,32 +468,48 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
     Begin a return.  Checks eligibility, creates a case, starts assistant.
     NEVER returns loyalty or suspicion.
     """
+    # Demo ids (CUST-00N) map to a real customer_uid for data-layer lookups.
+    resolved_uid = _DEMO_UID_BY_ID.get(body.customer_id, body.customer_id)
+
     # 1. Check eligibility
     eligibility = check_eligibility(
-        body.customer_id, body.order_number, body.sku, db
+        resolved_uid, body.order_number, body.sku, db
     )
     if not eligibility.eligible:
         raise HTTPException(status_code=400, detail=eligibility.reason)
 
-    # 2. Create case in DB
+    # 2. Cancel any lingering PENDING case for the same item (abandoned flow),
+    #    then create a fresh case.
+    db.execute(
+        text(
+            "UPDATE cases SET status = 'cancelled' "
+            "WHERE order_number = :on AND sku = :sku AND status = 'PENDING'"
+        ),
+        {"on": body.order_number, "sku": body.sku},
+    )
+
     case_id = str(uuid.uuid4())
     db.execute(
         text(
             "INSERT INTO cases "
-            "(id, customer_id, order_number, sku, item_id, reason_code, status, created_at) "
-            "VALUES (:id, :cid, :on, :sku, :iid, :rc, 'PENDING', :now)"
+            "(id, customer_id, order_number, sku, item_id, reason_code, status, created_at, source_channel) "
+            "VALUES (:id, :cid, :on, :sku, :iid, :rc, 'PENDING', :now, 'online')"
         ),
         {
             "id": case_id,
-            "cid": body.customer_id,
+            "cid": resolved_uid,
             "on": body.order_number,
             "sku": body.sku,
             "iid": body.item_id,
-            "rc": body.reason_code,
+            "rc": body.reason,
             "now": datetime.utcnow(),
         },
     )
     db.commit()
+
+    # 2b. Run triage now and write a human-readable AI decision to the
+    #     admin activity log (case_messages role='ai_log').
+    _log_triage_decision(case_id, db)
 
     # 3. Start assistant session — generate initial greeting
     if settings.llm_mock:
@@ -325,13 +517,13 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
         initial_message = run_mock_turn(
             agent,
             f"I'd like to return item {body.item_id} (order {body.order_number}) "
-            f"because: {body.reason_code}",
+            f"because: {body.reason}",
         )
     else:
         agent = build_assistant()
         response = agent(
             f"I'd like to return item {body.item_id} (order {body.order_number}) "
-            f"because: {body.reason_code}"
+            f"because: {body.reason}"
         )
         initial_message = str(response)
 
@@ -383,6 +575,17 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
     if status in ("APPROVED_NO_FEE", "APPROVED_WITH_FEE", "REJECTED"):
         raise HTTPException(status_code=400, detail=f"Case is already resolved: {status}")
 
+    # Admin can halt the AI for this case; stop processing further turns.
+    if status == "STOPPED":
+        return {
+            "message": (
+                "An agent has taken over this request. The automated assistant "
+                "has stopped and a team member will follow up if needed."
+            ),
+            "state": "STOPPED",
+            "vision_requested": False,
+        }
+
     # Persist user message
     db.execute(
         text(
@@ -393,11 +596,11 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
     )
     db.commit()
 
-    # Reload conversation history
+    # Reload conversation history (exclude internal ai_log entries)
     msg_rows = db.execute(
         text(
             "SELECT role, content FROM case_messages "
-            "WHERE case_id = :cid ORDER BY id ASC"
+            "WHERE case_id = :cid AND role != 'ai_log' ORDER BY id ASC"
         ),
         {"cid": case_id},
     ).fetchall()

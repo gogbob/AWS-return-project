@@ -56,9 +56,11 @@ def compute_triage(case_id: str, db: Session) -> TriageResult:
     """
 
     # ── Load case ─────────────────────────────────────────────────────────────
+    # Note: the `cases` table has no refund_amount column; it is resolved from
+    # the `returns` table below.
     case_row = db.execute(
         text(
-            "SELECT customer_id, order_number, sku, item_id, reason_code, refund_amount "
+            "SELECT customer_id, order_number, sku, item_id, reason_code "
             "FROM cases WHERE id = :cid"
         ),
         {"cid": case_id},
@@ -67,9 +69,10 @@ def compute_triage(case_id: str, db: Session) -> TriageResult:
     if case_row is None:
         raise ValueError(f"Case {case_id!r} not found")
 
-    customer_id, order_number, sku, item_id, reason_code, refund_amount = case_row
+    customer_id, order_number, sku, item_id, reason_code = case_row
+    refund_amount = None
 
-    # ── Step 0: resolve refund_amount if missing from cases table ─────────────
+    # ── Step 0: resolve refund_amount from the returns table ──────────────────
     if refund_amount is None and order_number and sku:
         amt_row = db.execute(
             text(

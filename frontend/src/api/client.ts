@@ -15,9 +15,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface DemoCustomer {
-  customer_id: string;
+  id: string;
   label: string;
-  loyalty?: number; // only populated in dev for tooltip
+  loyalty_dev?: number; // only populated in dev for tooltip
 }
 
 export interface ProductInfo {
@@ -130,6 +130,56 @@ export interface Recommendation {
   status: string;
 }
 
+export interface ItemInsightReason {
+  reason_code: string;
+  item_share: number;
+  baseline_share: number;
+  excess: number;
+  ratio: number;
+  significant: boolean;
+}
+
+export interface ItemInsightTopFlag {
+  reason_code: string;
+  group: string;
+  excess: number;
+  ratio: number;
+}
+
+export interface ItemInsightRecommendation {
+  id: number;
+  recommendation_type: string | null;
+  reason_code: string | null;
+  draft_text: string | null;
+  confidence: number | null;
+  status: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ItemInsight {
+  item_id: string;
+  item_name: string;
+  category: string | null;
+  n: number;
+  n_eff: number;
+  reasons: ItemInsightReason[];
+  overshoot: boolean;
+  max_excess: number;
+  top_flag: ItemInsightTopFlag | null;
+  recommendation: ItemInsightRecommendation | null;
+  needs_input: boolean;
+}
+
+export interface ActivityEntry {
+  case_id: string;
+  content: string;
+  created_at: string;
+  customer_label: string;
+  item_name: string | null;
+  status: string | null;
+}
+
 export interface DataHealth {
   last_ingest: string | null;
   row_counts: Record<string, number>;
@@ -221,6 +271,10 @@ export const api = {
     return request(`/admin/insights/${encodeURIComponent(item_id)}`);
   },
 
+  getItemInsights(): Promise<ItemInsight[]> {
+    return request('/admin/item-insights');
+  },
+
   getRecommendations(): Promise<Recommendation[]> {
     return request('/admin/recommendations');
   },
@@ -230,6 +284,25 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ decision }),
     });
+  },
+
+  checkout(
+    customer_id: string,
+    items: Array<{ item_name: string; size: string; price: number }>
+  ): Promise<{ order_number: string; items: OrderItem[] }> {
+    return request('/checkout', {
+      method: 'POST',
+      body: JSON.stringify({ customer_id, items }),
+    });
+  },
+
+  getActivity(caseId?: string): Promise<ActivityEntry[]> {
+    const q = caseId ? `?case_id=${encodeURIComponent(caseId)}` : '';
+    return request(`/admin/activity${q}`);
+  },
+
+  stopCase(caseId: string): Promise<{ success: boolean; new_status: string }> {
+    return request(`/admin/cases/${caseId}/stop`, { method: 'POST' });
   },
 
   getDataHealth(): Promise<DataHealth> {

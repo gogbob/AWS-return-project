@@ -16,8 +16,10 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import get_db
 from ..insights.engine import (
+    code_to_group,
     compute_anomaly,
     compute_category_baseline,
     compute_global_baseline,
@@ -26,10 +28,25 @@ from ..insights.engine import (
     recompute_category_baselines,
 )
 
-# Import the customer list so we can derive "Customer #N" labels
+# Import the customer list so we can derive display labels for cases.
 from .routes_customer import _DEMO_CUSTOMERS, CUSTOMER_LABEL_MAP
 
+# Cases store the resolved customer_uid; map uid -> friendly label for admin.
+_UID_TO_LABEL: dict[str, str] = {c["uid"]: c["label"] for c in _DEMO_CUSTOMERS}
+
 router = APIRouter(prefix="/api/admin", tags=["Admin"])
+
+
+def _append_ai_log(case_id: str, content: str, db: Session) -> None:
+    """Append a line to the AI activity log for a case (role='ai_log')."""
+    db.execute(
+        text(
+            "INSERT INTO case_messages (case_id, role, content, created_at) "
+            "VALUES (:cid, 'ai_log', :content, :now)"
+        ),
+        {"cid": case_id, "content": content, "now": datetime.utcnow()},
+    )
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -38,10 +55,16 @@ router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
 
 def _customer_label(customer_id: Optional[str]) -> str:
-    if customer_id and customer_id in CUSTOMER_LABEL_MAP:
+    if not customer_id:
+        return "Unknown"
+    # Cases now store the real customer_uid.
+    if customer_id in _UID_TO_LABEL:
+        return _UID_TO_LABEL[customer_id]
+    # Backwards-compat: older cases may hold the synthetic id.
+    if customer_id in CUSTOMER_LABEL_MAP:
         n = CUSTOMER_LABEL_MAP[customer_id]
         return f"Customer #{n}"
-    return customer_id or "Unknown"
+    return customer_id
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +336,113 @@ def admin_decision(
 
     db.commit()
 
+    # Record the admin's instruction to the AI in the activity log.
+    _ACTION_LOG_TEXT = {
+        "approve_no_fee": "👤 Admin instructed the AI: APPROVE with FREE shipping.",
+        "approve_with_fee": "👤 Admin instructed the AI: APPROVE with a reduced-cost return (shipping fee).",
+        "reject": "👤 Admin instructed the AI: REJECT this return.",
+        "mark_fraud": "👤 Admin instructed the AI: REJECT and flag as fraud.",
+        "release": "👤 Admin released the case back to the AI for processing.",
+    }
+    log_line = _ACTION_LOG_TEXT.get(body.action, f"👤 Admin action: {body.action}.")
+    if body.note:
+        log_line += f' Note to customer: "{body.note}"'
+    _append_ai_log(case_id, log_line, db)
+
     return {"success": True, "case_id": case_id, "new_status": new_status}
+
+
+# ---------------------------------------------------------------------------
+# 3b. POST /api/admin/cases/{id}/stop — halt the AI for this case
+# ---------------------------------------------------------------------------
+
+
+@router.post("/cases/{case_id}/stop")
+def admin_stop_case(case_id: str, db: Session = Depends(get_db)):
+    """
+    Tell the AI to stop processing a case. The customer-facing assistant will
+    no longer respond for this case. (No human-chat takeover is implemented —
+    the AI simply halts.)
+    """
+    case_row = db.execute(
+        text("SELECT id, status FROM cases WHERE id = :cid"),
+        {"cid": case_id},
+    ).fetchone()
+    if not case_row:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    db.execute(
+        text(
+            "UPDATE cases SET status = 'STOPPED', decided_by = 'admin', "
+            "decided_at = :now WHERE id = :cid"
+        ),
+        {"now": datetime.utcnow(), "cid": case_id},
+    )
+    db.commit()
+
+    _append_ai_log(
+        case_id,
+        "🛑 Admin told the AI to STOP dealing with this customer. "
+        "The automated assistant has halted all processing for this case.",
+        db,
+    )
+
+    return {"success": True, "case_id": case_id, "new_status": "STOPPED"}
+
+
+# ---------------------------------------------------------------------------
+# 3c. GET /api/admin/activity — AI activity log feed across cases
+# ---------------------------------------------------------------------------
+
+
+@router.get("/activity")
+def admin_activity(
+    case_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the AI activity log (role='ai_log'), newest first. Optionally filter
+    to a single case. Each entry carries the case id, customer label, item, and
+    the AI/admin log line.
+    """
+    params: dict = {}
+    where = "cm.role = 'ai_log'"
+    if case_id:
+        where += " AND cm.case_id = :cid"
+        params["cid"] = case_id
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                cm.case_id,
+                cm.content,
+                cm.created_at,
+                c.customer_id,
+                oi.orderitem_product_name,
+                c.status
+            FROM case_messages cm
+            LEFT JOIN cases c ON c.id = cm.case_id
+            LEFT JOIN order_items oi ON oi.item_id = c.item_id
+            WHERE {where}
+            ORDER BY cm.id DESC
+            LIMIT 200
+            """  # noqa: S608 - where clause is built from constants only
+        ),
+        params,
+    ).fetchall()
+
+    return [
+        {
+            "case_id": r[0],
+            "content": r[1],
+            "created_at": r[2],
+            "customer_label": _customer_label(r[3]),
+            "item_name": r[4],
+            "status": r[5],
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +507,168 @@ def list_insights(
             continue
 
     results.sort(key=lambda x: x["js_distance"], reverse=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 4b. GET /api/admin/item-insights
+# ---------------------------------------------------------------------------
+
+_INSIGHT_META_KEYS = {"n", "n_eff", "scope", "n_items"}
+
+
+@router.get("/item-insights")
+def list_item_insights(db: Session = Depends(get_db)):
+    """
+    Per-item return-reason insights for the admin "Item insights" page.
+
+    One object per item that has returns (n > 0). Composes the existing
+    insights engine (same calls / conventions as get_insight_detail):
+    item distribution, category/global baseline, and anomaly flags. Each
+    object carries the per-reason item vs. baseline shares, an overshoot
+    indicator, the latest recommendation (the "what change was made / when"
+    record), and whether admin input is needed.
+    """
+    rows = db.execute(
+        text("SELECT item_id, orderitem_product_name, category FROM order_items")
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        item_id, name, category = row
+        try:
+            item_dist = compute_item_distribution(item_id, db)
+            n = item_dist.get("n", 0)
+            if n == 0:
+                continue  # skip items with no returns
+
+            n_eff = item_dist.get("n_eff", 0.0)
+
+            if category:
+                baseline = compute_category_baseline(category, db)
+            else:
+                baseline = compute_global_baseline(db)
+
+            # Union of reason codes present in the item distribution and baseline.
+            item_shares = {
+                k: float(v)
+                for k, v in item_dist.items()
+                if k not in _INSIGHT_META_KEYS
+            }
+            baseline_shares = {
+                k: float(v)
+                for k, v in baseline.items()
+                if k not in _INSIGHT_META_KEYS and isinstance(v, (int, float))
+            }
+            codes = set(item_shares) | set(baseline_shares)
+
+            # Match each reason to its FlagResult (when compute_anomaly produced one).
+            flags_raw = compute_anomaly(item_id, db)
+            flag_by_code = {f.reason_code: f for f in flags_raw}
+
+            reasons = []
+            for code in codes:
+                item_share = item_shares.get(code, 0.0)
+                baseline_share = baseline_shares.get(code, 0.0)
+                flag = flag_by_code.get(code)
+                if flag is not None:
+                    excess = flag.excess
+                    ratio = flag.ratio
+                    significant = flag.significant
+                else:
+                    excess = item_share - baseline_share
+                    ratio = item_share / max(baseline_share, 1e-9)
+                    significant = False
+                reasons.append(
+                    {
+                        "reason_code": code,
+                        "item_share": round(item_share, 4),
+                        "baseline_share": round(baseline_share, 4),
+                        "excess": round(excess, 4),
+                        "ratio": round(ratio, 4),
+                        "significant": significant,
+                    }
+                )
+
+            # overshoot = any significant reason whose excess clears flag_min_excess.
+            overshooting = [
+                r
+                for r in reasons
+                if r["significant"] and r["excess"] >= settings.flag_min_excess
+            ]
+            overshoot = len(overshooting) > 0
+
+            positive_excess = [r["excess"] for r in reasons if r["excess"] > 0]
+            max_excess = round(max(positive_excess), 4) if positive_excess else 0.0
+
+            top_flag = None
+            if overshoot:
+                worst = max(overshooting, key=lambda r: r["excess"])
+                top_flag = {
+                    "reason_code": worst["reason_code"],
+                    "group": code_to_group(worst["reason_code"]),
+                    "excess": worst["excess"],
+                    "ratio": worst["ratio"],
+                }
+
+            # Latest recommendation row (the "change made / when" record).
+            rec_row = db.execute(
+                text(
+                    "SELECT id, recommendation_type, reason_code, draft_text, "
+                    "confidence, status, created_at, updated_at "
+                    "FROM recommendations WHERE item_id = :iid "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1"
+                ),
+                {"iid": item_id},
+            ).fetchone()
+            recommendation = None
+            if rec_row is not None:
+                recommendation = {
+                    "id": rec_row[0],
+                    "recommendation_type": rec_row[1],
+                    "reason_code": rec_row[2],
+                    "draft_text": rec_row[3],
+                    "confidence": rec_row[4],
+                    "status": rec_row[5],
+                    "created_at": rec_row[6],
+                    "updated_at": rec_row[7],
+                }
+
+            # needs_input: a pending ('proposed') recommendation, OR a significant
+            # DEFECT-group flag with no applied recommendation yet.
+            has_proposed = recommendation is not None and recommendation["status"] == "proposed"
+            has_applied = recommendation is not None and recommendation["status"] == "applied"
+            defect_flag = any(
+                r["significant"] and code_to_group(r["reason_code"]) == "DEFECT"
+                for r in reasons
+            )
+            needs_input = has_proposed or (defect_flag and not has_applied)
+
+            # Sort reasons for a stable, readable chart (biggest deviation first).
+            reasons.sort(key=lambda r: r["excess"], reverse=True)
+
+            results.append(
+                {
+                    "item_id": item_id,
+                    "item_name": name,
+                    "category": category,
+                    "n": n,
+                    "n_eff": round(float(n_eff), 2),
+                    "reasons": reasons,
+                    "overshoot": overshoot,
+                    "max_excess": max_excess,
+                    "top_flag": top_flag,
+                    "recommendation": recommendation,
+                    "needs_input": needs_input,
+                }
+            )
+        except Exception:
+            continue
+
+    results.sort(
+        key=lambda x: (x["overshoot"], x["max_excess"], x["n"]),
+        reverse=True,
+    )
     return results
 
 
