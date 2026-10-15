@@ -19,6 +19,50 @@ from sqlalchemy.orm import Session
 
 from tests.conftest import make_case
 
+
+def _insert_item_with_returns(
+    session: Session,
+    item_id: str,
+    category: str,
+    returns: list[tuple[str, str]],  # [(customer_uid, reason_code), ...]
+) -> None:
+    """Insert an order_item and N completed returns into the test DB."""
+    session.execute(
+        text(
+            "INSERT OR IGNORE INTO order_items "
+            "(item_id, sku, orderitem_product_name, category, store_banner) "
+            "VALUES (:iid, :sku, :name, :cat, 'ALDO')"
+        ),
+        {"iid": item_id, "sku": item_id, "name": item_id, "cat": category},
+    )
+    for idx, (cid, rc) in enumerate(returns):
+        session.execute(
+            text(
+                "INSERT OR IGNORE INTO customers (customer_id, loyalty, fraud_flag) "
+                "VALUES (:cid, 50, 0)"
+            ),
+            {"cid": cid},
+        )
+        session.execute(
+            text(
+                "INSERT INTO returns "
+                "(order_number, sku, item_id, customer_uid, "
+                " return_creation_date, last_return_status, reason_code, "
+                " source, fraud_flag) "
+                "VALUES (:on, :sku, :iid, :cid, "
+                "        '2025-01-01', 'RETURN_COMPLETED', :rc, 'csv', 0)"
+            ),
+            {
+                "on": f"ORD-{item_id}-{idx}",
+                "sku": item_id,
+                "iid": item_id,
+                "cid": cid,
+                "rc": rc,
+            },
+        )
+    session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Forbidden tokens that must never appear in customer-facing responses
 # ---------------------------------------------------------------------------
@@ -307,3 +351,94 @@ def test_no_loyalty_leak_in_assistant_messages(
                     f"Forbidden token {token!r} found in assistant message: "
                     f"{content[:120]!r}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/item-insights — per-item return-reason insights page
+# ---------------------------------------------------------------------------
+
+_ITEM_INSIGHT_KEYS = {
+    "item_id",
+    "item_name",
+    "category",
+    "n",
+    "n_eff",
+    "reasons",
+    "overshoot",
+    "max_excess",
+    "top_flag",
+    "recommendation",
+    "needs_input",
+}
+
+_ITEM_INSIGHT_REASON_KEYS = {
+    "reason_code",
+    "item_share",
+    "baseline_share",
+    "excess",
+    "ratio",
+    "significant",
+}
+
+
+def test_item_insights_shape_and_overshoot(
+    test_db: Session, test_client: TestClient
+) -> None:
+    """
+    Seed one high-defect item (exceeds MIN_RETURNS_FLAG / MIN_CUSTOMERS_FLAG so
+    its 'defect' reason overshoots the near-zero baseline) alongside the
+    conftest's normal ITEM-BOOTS. Assert the endpoint returns a non-empty list
+    with the documented shape, the overshooting item is flagged and sorted
+    first, and no forbidden tokens leak.
+    """
+    # 100 customers: 80 defect, 20 other → significant defect overshoot.
+    returns: list[tuple[str, str]] = []
+    for j in range(80):
+        returns.append((f"CUST-DEF-D{j}", "defect"))
+    for j in range(20):
+        returns.append((f"CUST-DEF-O{j}", "other"))
+    _insert_item_with_returns(test_db, "ITEM-DEFECT", "boots", returns)
+
+    resp = test_client.get("/api/admin/item-insights")
+    assert resp.status_code == 200, f"item-insights failed: {resp.text}"
+    data = resp.json()
+    assert isinstance(data, list) and len(data) > 0, "Expected a non-empty list"
+
+    # Every object has the documented keys; each reason has its keys.
+    for obj in data:
+        assert _ITEM_INSIGHT_KEYS.issubset(obj.keys()), (
+            f"Missing keys: {_ITEM_INSIGHT_KEYS - set(obj.keys())}"
+        )
+        assert isinstance(obj["reasons"], list) and len(obj["reasons"]) > 0
+        for reason in obj["reasons"]:
+            assert _ITEM_INSIGHT_REASON_KEYS.issubset(reason.keys()), (
+                f"Reason missing keys: {_ITEM_INSIGHT_REASON_KEYS - set(reason.keys())}"
+            )
+            assert 0.0 <= reason["item_share"] <= 1.0
+            assert 0.0 <= reason["baseline_share"] <= 1.0
+
+    by_id = {obj["item_id"]: obj for obj in data}
+    assert "ITEM-DEFECT" in by_id, "Seeded high-defect item should appear"
+    assert "ITEM-BOOTS" in by_id, "Conftest boots item should appear"
+
+    # The conftest ITEM-BOOTS (76% too_small vs ~22% baseline) overshoots on a
+    # significant FIT_SIZE flag; it must be flagged and sorted ahead of neutral
+    # items with its worst reason reported in top_flag/max_excess.
+    boots = by_id["ITEM-BOOTS"]
+    assert boots["overshoot"] is True, "ITEM-BOOTS must overshoot on too_small"
+    assert boots["top_flag"] is not None
+    assert boots["top_flag"]["reason_code"] == "too_small"
+    assert boots["max_excess"] > 0
+
+    # Overshooting items are sorted ahead of non-overshooting ones, by max_excess.
+    assert data[0]["overshoot"] is True, "Most-concerning item must sort first"
+    overshoot_run_ended = False
+    for obj in data:
+        if obj["overshoot"]:
+            assert not overshoot_run_ended, "Overshooting items must group first"
+        else:
+            overshoot_run_ended = True
+
+    # No loyalty/suspicion/fraud leak in keys or string values.
+    violations = _contains_forbidden(data)
+    assert violations == [], f"Forbidden tokens in item-insights: {violations}"

@@ -6,12 +6,13 @@ import RecommendationsTable from '../components/admin/RecommendationsTable';
 import DataHealth from '../components/admin/DataHealth';
 import ActivityLog from '../components/admin/ActivityLog';
 
-type Tab = 'activity' | 'queue' | 'insights' | 'recommendations' | 'health';
+type Tab = 'activity' | 'queue' | 'insights' | 'item-insights' | 'recommendations' | 'health';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'activity', label: 'Activity log' },
   { key: 'queue', label: 'Review queue' },
   { key: 'insights', label: 'Insights' },
+  { key: 'item-insights', label: 'Item insights' },
   { key: 'recommendations', label: 'Recommendations' },
   { key: 'health', label: 'Data health' },
 ];
@@ -58,6 +59,7 @@ export default function AdminPage() {
         {activeTab === 'activity' && <ActivityLog />}
         {activeTab === 'queue' && <CaseQueue />}
         {activeTab === 'insights' && <InsightsTable />}
+        {activeTab === 'item-insights' && <ItemInsights />}
         {activeTab === 'recommendations' && <RecommendationsTable />}
         {activeTab === 'health' && <DataHealth />}
       </div>

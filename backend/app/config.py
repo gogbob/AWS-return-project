@@ -7,8 +7,17 @@ project root). Defaults match the values documented in .env.example.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load the backend/.env into os.environ so that libraries reading the
+# process environment directly (notably boto3's default credential chain for
+# Bedrock) can see AWS_* and other vars. pydantic-settings reads the .env into
+# the Settings object, but does NOT export values to os.environ.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 class Settings(BaseSettings):

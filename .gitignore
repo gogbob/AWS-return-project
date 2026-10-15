@@ -3,3 +3,7 @@ data/raw/*
 # SQLite database (regenerated from ingestion)
 backend/aldo_returns.db
 backend/*.db
+# Environment / secrets — never commit credentials
+.env
+*.env
+backend/.env

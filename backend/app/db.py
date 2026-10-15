@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
@@ -19,15 +19,33 @@ from .config import settings
 # Engine
 # ---------------------------------------------------------------------------
 
+_is_sqlite = settings.database_url.startswith("sqlite")
+
 engine = create_engine(
     settings.database_url,
     # SQLite-specific: allow the same connection to be used across threads
-    # (necessary for FastAPI's thread-pool request handling).
-    connect_args={"check_same_thread": False}
-    if settings.database_url.startswith("sqlite")
+    # (necessary for FastAPI's thread-pool request handling) and wait up to
+    # 30s for a lock instead of failing immediately with "database is locked".
+    # The real LLM (Bedrock) turn holds a request open for several seconds, so
+    # concurrent tool sessions can otherwise collide on SQLite's single writer.
+    connect_args={"check_same_thread": False, "timeout": 30}
+    if _is_sqlite
     else {},
     echo=False,  # set to True during local debugging to log all SQL
 )
+
+
+if _is_sqlite:
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):  # noqa: ANN001
+        """Enable WAL mode and a busy timeout so readers and a writer can
+        coexist and brief lock contention is retried rather than erroring."""
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 # ---------------------------------------------------------------------------
 # Session factory
