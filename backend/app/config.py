@@ -19,6 +19,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # the Settings object, but does NOT export values to os.environ.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+# Default location for generated Parquet exports, derived from this module's
+# location the same way database_url is pinned to the backend path. Resolves to
+# backend/data/parquet. Overridable via the PARQUET_DIR env var.
+_PARQUET_DIR_DEFAULT = str(Path(__file__).resolve().parent.parent / "data" / "parquet")
+
 
 class Settings(BaseSettings):
     """Application-wide configuration loaded from environment / .env."""
@@ -88,6 +93,31 @@ class Settings(BaseSettings):
     database_url: str = Field(
         "sqlite:///c:/AWS/AWS-return-project/backend/aldo_returns.db",
         description="SQLAlchemy database URL",
+    )
+
+    # ── Hybrid data layer (S3 / Glue / Athena / DuckDB) ───────────────────────
+    # Analytics can be served from SQLite (local), DuckDB over Parquet, or
+    # Athena over S3-hosted Parquet. All values are env-overridable; the system
+    # degrades gracefully to SQLite when AWS creds are absent or expired.
+    s3_bucket: str = Field(
+        "aldo-returns-detectiveagent", description="S3 bucket holding the Parquet datasets"
+    )
+    s3_datasets_prefix: str = Field(
+        "datasets/", description="Key prefix under which Parquet datasets live in the bucket"
+    )
+    athena_results_s3: str = Field(
+        "s3://aldo-returns-detectiveagent/athena-results/",
+        description="S3 location for Athena query results",
+    )
+    glue_database: str = Field(
+        "aldo_returns", description="Glue catalog database registered over the Parquet datasets"
+    )
+    athena_workgroup: str = Field("primary", description="Athena workgroup to run queries in")
+    data_backend: str = Field(
+        "auto", description="Analytics backend: one of auto|athena|duckdb|sqlite"
+    )
+    parquet_dir: str = Field(
+        _PARQUET_DIR_DEFAULT, description="Local directory for generated Parquet exports"
     )
 
 
