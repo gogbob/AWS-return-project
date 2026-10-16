@@ -869,7 +869,18 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
 # ---------------------------------------------------------------------------
 
 _UPLOAD_ROOT = Path(__file__).parents[3] / "storage" / "uploads"
-_ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+# Accept the common JPEG/PNG/WebP MIME spellings. Browsers and operating
+# systems are inconsistent (e.g. some send image/jpg instead of image/jpeg,
+# or an empty / application/octet-stream type), so we also fall back to the
+# file extension below rather than rejecting a perfectly valid image.
+_ALLOWED_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/pjpeg",
+    "image/png",
+    "image/webp",
+}
+_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
@@ -883,11 +894,21 @@ async def upload_photo(
     Accept a photo, run the Vision agent, persist verdict.
     NEVER returns loyalty or suspicion.
     """
-    # Validate content type
-    if file.content_type not in _ALLOWED_CONTENT_TYPES:
+    # Validate by content-type OR file extension. Browsers vary in the MIME
+    # type they report (image/jpg vs image/jpeg, or none at all), so accept the
+    # upload when EITHER the reported type is a known image type OR the filename
+    # has a supported image extension.
+    content_type = (file.content_type or "").lower()
+    ext = Path(file.filename or "").suffix.lower()
+    type_ok = content_type in _ALLOWED_CONTENT_TYPES
+    ext_ok = ext in _ALLOWED_EXTENSIONS
+    if not (type_ok or ext_ok):
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Must be jpg, png, or webp.",
+            detail=(
+                f"Unsupported file type ({file.content_type or 'unknown'}). "
+                "Please upload a JPG, PNG, or WebP image."
+            ),
         )
 
     # Read and size-check
@@ -976,7 +997,10 @@ async def upload_photo(
     return {
         "verdict": verdict.verdict,
         "state": new_state,
-        "assistant_message": assistant_message,
+        # Frontend reads `message`; vision_requested=True only if another photo
+        # is needed (ask_again → still VISION_REVIEW).
+        "message": assistant_message,
+        "vision_requested": new_state == "VISION_REVIEW",
     }
 
 
@@ -1006,10 +1030,12 @@ def refuse_photo(case_id: str, db: Session = Depends(get_db)):
 
     return {
         "state": "HUMAN_REVIEW",
-        "assistant_message": (
+        # Frontend reads `message`.
+        "message": (
             "No problem. Your return has been escalated to our customer service team. "
             "A representative will follow up within 1–2 business days."
         ),
+        "vision_requested": False,
     }
 
 

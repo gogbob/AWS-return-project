@@ -257,13 +257,19 @@ export const api = {
     });
   },
 
-  uploadPhoto(case_id: string, file: File): Promise<MessageResponse> {
+  async uploadPhoto(case_id: string, file: File): Promise<MessageResponse> {
     const form = new FormData();
+    // Do NOT set Content-Type — the browser adds the multipart boundary.
     form.append('file', file);
-    return fetch(`${BASE}/returns/${case_id}/photo`, {
+    const res = await fetch(`${BASE}/returns/${case_id}/photo`, {
       method: 'POST',
       body: form,
-    }).then((r) => r.json());
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `HTTP ${res.status}`);
+    }
+    return res.json() as Promise<MessageResponse>;
   },
 
   refusePhoto(case_id: string): Promise<MessageResponse> {

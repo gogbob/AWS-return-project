@@ -76,7 +76,13 @@ export default function ChatWindow({ caseId, initialMessage, initialState }: Cha
     } catch (err: unknown) {
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: 'Something went wrong. Please try again.' },
+        {
+          role: 'assistant',
+          content:
+            "We couldn't process your input. Please try again, or reach our " +
+            'support team at returns@aldo-demo.com or 1-800-555-0123 and ' +
+            "we'll help you finish your return.",
+        },
       ]);
     } finally {
       setSending(false);

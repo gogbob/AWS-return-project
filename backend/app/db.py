@@ -21,18 +21,25 @@ from .config import settings
 
 _is_sqlite = settings.database_url.startswith("sqlite")
 
-engine = create_engine(
-    settings.database_url,
-    # SQLite-specific: allow the same connection to be used across threads
-    # (necessary for FastAPI's thread-pool request handling) and wait up to
-    # 30s for a lock instead of failing immediately with "database is locked".
-    # The real LLM (Bedrock) turn holds a request open for several seconds, so
-    # concurrent tool sessions can otherwise collide on SQLite's single writer.
-    connect_args={"check_same_thread": False, "timeout": 30}
-    if _is_sqlite
-    else {},
-    echo=False,  # set to True during local debugging to log all SQL
-)
+if _is_sqlite:
+    # Local SQLite demo under a threaded server. WAL mode (set in the connect
+    # pragma below) lets multiple readers run concurrently with one writer, so
+    # a long-running read (e.g. computing a category baseline, or a slow LLM
+    # turn holding its session) does NOT block cheap reads on other
+    # connections. We use a generously-sized QueuePool with a long checkout
+    # timeout; pool_recycle avoids stale handles. (A single-connection
+    # StaticPool would serialize every request behind the slowest one.)
+    engine = create_engine(
+        settings.database_url,
+        connect_args={"check_same_thread": False, "timeout": 30},
+        pool_size=20,
+        max_overflow=40,
+        pool_timeout=60,
+        pool_recycle=1800,
+        echo=False,
+    )
+else:
+    engine = create_engine(settings.database_url, echo=False)
 
 
 if _is_sqlite:
