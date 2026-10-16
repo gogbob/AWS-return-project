@@ -43,15 +43,41 @@ router = APIRouter()
 # returnable-item list reflects actual order history. The public-facing "id"
 # is a stable synthetic key; `uid` is what the data layer filters on.
 _DEMO_CUSTOMERS: list[dict] = [
+    {"id": "CUST-OWNER", "uid": "SID:OWNER-ALDO", "label": "Owner of ALDO", "_loyalty": 100},  # owner — very high priority
     {"id": "CUST-LOYAL", "uid": "SID:10005372135022", "label": "Loyal Customer", "_loyalty": 95},    # high loyalty
     {"id": "CUST-UNLOYAL", "uid": "SID:102909224525987", "label": "Unloyal Customer", "_loyalty": 8},  # low loyalty
 ]
+
+# The Owner's DB loyalty is deliberately OUTSIZED (not the UI band above) so a
+# single return carries enough weight to move an item's weighted reason chart.
+# weight = 0.5 + loyalty/100  →  loyalty 50000 ⇒ weight ~500.5.
+_OWNER_UID = "SID:OWNER-ALDO"
+_OWNER_DB_LOYALTY = 50000
 
 # Map public demo id -> real customer_uid for the data layer.
 _DEMO_UID_BY_ID: dict[str, str] = {c["id"]: c["uid"] for c in _DEMO_CUSTOMERS}
 
 # Map label → customer index for fast admin lookup (used by admin routes too)
 CUSTOMER_LABEL_MAP: dict[str, int] = {c["id"]: i + 1 for i, c in enumerate(_DEMO_CUSTOMERS)}
+
+
+def _ensure_owner_customer(db: Session) -> None:
+    """
+    Idempotently seed the "Owner of ALDO" demo customer into the customers
+    table with the outsized loyalty that gives his returns their heavy weight.
+
+    Uses INSERT OR IGNORE so repeated calls never duplicate or overwrite the
+    row (the primary key is customer_id). Does NOT change the loyalty weighting
+    formula, which lives only in SQL in insights/engine.py.
+    """
+    db.execute(
+        text(
+            "INSERT OR IGNORE INTO customers (customer_id, loyalty, fraud_flag) "
+            "VALUES (:uid, :loyalty, 0)"
+        ),
+        {"uid": _OWNER_UID, "loyalty": _OWNER_DB_LOYALTY},
+    )
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -570,35 +596,146 @@ def _log_triage_decision(case_id: str, db: Session) -> None:
             db,
         )
 
-        # ── PART 4: AI may update the listing when the item overshoots ────────
-        # Guarded so a listing-analysis failure never breaks start_return.
+        # ── PART 4/C: auto-detect-and-apply a listing change on return arrival ─
+        # After the return is logged (and counted by the engine), re-check
+        # whether the item's weighted reason distribution now overshoots the
+        # category baseline. If it does on a fit/size reason — or the item is
+        # defect-suspected across sizes — AUTO-ADMINISTER the change here
+        # (create AND apply the recommendation, status='applied') so no human
+        # has to open Item insights, and DISPLAY the change in the admin
+        # activity log. The whole block is guarded so a failure never breaks
+        # start_return.
         try:
-            from app.api.routes_admin import _build_item_insight
-
-            cat_row = db.execute(
-                text("SELECT orderitem_product_name, category FROM order_items WHERE item_id = :iid"),
-                {"iid": item_id},
-            ).fetchone()
-            if cat_row is not None:
-                insight = _build_item_insight(item_id, cat_row[0], cat_row[1], db)
-                if insight is not None and (
-                    insight.get("overshoot") or insight.get("defect_suspected")
-                ):
-                    if insight.get("defect_suspected"):
-                        note = (
-                            f"🛠️ The AI may update the listing for {item_label} — this item is "
-                            "defect-suspected across multiple sizes, so it may recommend removing "
-                            "the product from the site (pending admin confirmation)."
-                        )
-                    else:
-                        note = (
-                            f"🛠️ The AI may update the listing for {item_label} — its return "
-                            "reasons overshoot the category average, so it may adjust the size "
-                            "guidance or product description."
-                        )
-                    _append_ai_log(case_id, note, db)
+            _auto_apply_listing_change(case_id, item_id, item_label, db)
         except Exception:  # noqa: BLE001 - listing analysis must never break the return
             pass
+
+
+# Reason codes that are size/fit related (map a flagged direction to guidance).
+_FIT_SIZE_CODES = ("too_small", "too_big", "too_narrow", "too_wide")
+
+
+def _auto_apply_listing_change(
+    case_id: str, item_id: str, item_label: str, db: Session
+) -> None:
+    """
+    PART C — on every return arrival, re-check the item's weighted reason
+    distribution vs. the category baseline and auto-apply a listing change when
+    it overshoots on a fit/size reason (or the item is defect-suspected).
+
+    Creates AND applies the recommendation (status='applied') and appends an
+    activity-log line describing the change. Idempotent: if an 'applied'
+    recommendation of the same type already exists for the item, it does not
+    duplicate (and skips re-logging).
+    """
+    # Local import avoids a circular import (routes_admin imports this module).
+    from app.api.routes_admin import _build_item_insight
+
+    # NOTE: we deliberately do NOT invalidate the baseline cache here. The
+    # category baseline is a median across ALL items in the category and is
+    # effectively unchanged by a single new return — recomputing it on the hot
+    # path of a return cost ~30s for a large category ("other") and made the
+    # return feel slow. The item's OWN distribution and anomaly flags are
+    # recomputed fresh from the returns table inside _build_item_insight on
+    # every call, so the new return IS reflected; only the stable category
+    # baseline is reused from cache. (Baselines are refreshed at startup.)
+    cat_row = db.execute(
+        text("SELECT orderitem_product_name, category FROM order_items WHERE item_id = :iid"),
+        {"iid": item_id},
+    ).fetchone()
+    if cat_row is None:
+        return
+
+    name, category = cat_row[0] or item_label, cat_row[1]
+    insight = _build_item_insight(item_id, name, category, db)
+    if insight is None:
+        return
+
+    top_flag = insight.get("top_flag") or {}
+    overshoot = bool(insight.get("overshoot"))
+    defect_suspected = bool(insight.get("defect_suspected"))
+    fit_overshoot = overshoot and top_flag.get("reason_code") in _FIT_SIZE_CODES
+
+    if not (fit_overshoot or defect_suspected):
+        return
+
+    # Defect across sizes takes precedence (needs product removal, not sizing).
+    if defect_suspected:
+        rec_type = "quality_review"
+        reason_code = "defect"
+        confidence = float(insight.get("defect_combined_share") or 0.0)
+        dims = ", ".join(insight.get("defect_dimensions", [])) or "multiple sizes"
+        draft_text = (
+            f"Returns for {item_label} overshoot the category average across "
+            f"opposing fit dimensions ({dims}) — the product itself appears "
+            "defective. Recommend removing it from the site (admin confirmation "
+            "required to delist)."
+        )
+        log_detail = (
+            f"✅ Auto-flagged {item_label} as defect-suspected: fit returns crossed "
+            f"the review threshold across {dims} — recommended removing the product "
+            "from the site (admin confirmation needed). No human action needed to "
+            "surface this."
+        )
+    else:
+        reason_code = top_flag.get("reason_code")
+        excess = float(top_flag.get("excess") or 0.0)
+        confidence = excess
+        rec_type = "size_guidance"
+        # Wording per the flagged direction. ProductDetailPage derives the
+        # ±0.5 "true size" from the "runs small"/"size up" phrasing, so keep it.
+        if reason_code in ("too_small", "too_narrow"):
+            draft_text = (
+                "Based on recent returns, this style runs small — we recommend "
+                "ordering a half size up."
+            )
+            direction = "recommend sizing up"
+        else:  # too_big / too_wide
+            draft_text = (
+                "Based on recent returns, this style runs large — we recommend "
+                "ordering a half size down."
+            )
+            direction = "recommend sizing down"
+        log_detail = (
+            f"✅ Auto-applied listing change for {item_label}: {reason_code} crossed "
+            f"the review threshold (excess +{excess:.2f} vs category) — size guidance "
+            f"updated to {direction}. No human action needed."
+        )
+
+    # IDEMPOTENT: do not duplicate an existing applied recommendation of the
+    # same type for this item (and reason).
+    existing = db.execute(
+        text(
+            "SELECT id FROM recommendations "
+            "WHERE item_id = :iid AND recommendation_type = :rtype "
+            "  AND reason_code = :rc AND status = 'applied'"
+        ),
+        {"iid": item_id, "rtype": rec_type, "rc": reason_code},
+    ).fetchone()
+    if existing is not None:
+        return
+
+    now = datetime.utcnow()
+    db.execute(
+        text(
+            "INSERT INTO recommendations "
+            "(item_id, category, recommendation_type, reason_code, draft_text, "
+            " confidence, status, created_at, updated_at) "
+            "VALUES (:iid, :cat, :rtype, :rc, :draft, :conf, 'applied', :now, :now)"
+        ),
+        {
+            "iid": item_id,
+            "cat": category,
+            "rtype": rec_type,
+            "rc": reason_code,
+            "draft": draft_text,
+            "conf": confidence,
+            "now": now,
+        },
+    )
+    db.commit()
+
+    _append_ai_log(case_id, log_detail, db)
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +759,11 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
     """
     # Demo ids (CUST-00N) map to a real customer_uid for data-layer lookups.
     resolved_uid = _DEMO_UID_BY_ID.get(body.customer_id, body.customer_id)
+
+    # Make sure the "Owner of ALDO" demo customer exists with his outsized
+    # loyalty before any of his returns are counted. Cheap INSERT OR IGNORE.
+    if resolved_uid == _OWNER_UID:
+        _ensure_owner_customer(db)
 
     # 1. Check eligibility
     eligibility = check_eligibility(
@@ -655,6 +797,46 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
             "iid": body.item_id,
             "rc": body.reason,
             "now": datetime.utcnow(),
+        },
+    )
+
+    # 2a. Record a COUNTED returns row so "the return arrives" and is picked up
+    #     by the insights engine (which only counts RETURN_COMPLETED/_RECEIVED/
+    #     _PROCESSED). start_return previously inserted no returns row, so no
+    #     item's reason chart ever moved from the live app. The raw `reason` is
+    #     stored as the UI code, which now maps to a granular reason code via
+    #     reason_to_code (reason_taxonomy.yaml), so it lands in the right bar.
+    #     Carry forward a refund_amount from the most-recent prior row for this
+    #     (order, sku) if one exists so the engine's price/value logic has data.
+    now = datetime.utcnow()
+    prior_refund = db.execute(
+        text(
+            "SELECT refund_amount FROM returns "
+            "WHERE order_number = :on AND sku = :sku AND refund_amount IS NOT NULL "
+            "ORDER BY return_creation_date DESC LIMIT 1"
+        ),
+        {"on": body.order_number, "sku": body.sku},
+    ).fetchone()
+    refund_amount = float(prior_refund[0]) if prior_refund else None
+    db.execute(
+        text(
+            "INSERT INTO returns "
+            "(order_number, sku, item_id, customer_uid, return_order_number, "
+            " return_creation_date, last_return_status, refund_amount, "
+            " item_return_qty, reason, reason_code, source, fraud_flag) "
+            "VALUES (:on, :sku, :iid, :cid, :ron, :now, 'RETURN_RECEIVED', "
+            " :refund, 1, :reason, :reason_code, 'live', 0)"
+        ),
+        {
+            "on": body.order_number,
+            "sku": body.sku,
+            "iid": body.item_id,
+            "cid": resolved_uid,
+            "ron": f"RTN-{uuid.uuid4().hex[:10].upper()}",
+            "now": now,
+            "refund": refund_amount,
+            "reason": body.reason,
+            "reason_code": body.reason,
         },
     )
     db.commit()

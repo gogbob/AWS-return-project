@@ -32,7 +32,10 @@ class VisionVerdict(BaseModel):
 
     verdict: Literal["consistent", "inconsistent", "unclear"]
     confidence: float = Field(ge=0.0, le=1.0, description="Model confidence 0.0–1.0")
-    observations: str = Field(max_length=200, description="Short description of what the model saw")
+    # No hard max_length: the real model often writes a fuller description than
+    # a strict 200-char cap allows, which previously failed structured-output
+    # validation and 500'd the upload. We trim for storage/display instead.
+    observations: str = Field(description="Short description of what the model saw")
     matches_ordered_product: bool
     defect_visible: Optional[bool] = None
 
@@ -201,7 +204,7 @@ def build_vision_agent(
     from strands.models import BedrockModel
 
     model = BedrockModel(
-        model_id=settings.model_id or "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        model_id=settings.model_id or "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         region_name=settings.aws_region or None,
     )
     return Agent(
@@ -275,6 +278,11 @@ class VisionSession:
         # The agent uses structured_output_model=VisionVerdict so the SDK
         # coerces the model response into a VisionVerdict instance.
         agent = build_vision_agent(self.reason_code)
+        # Bedrock (via Strands) expects the image bytes inline under
+        # source.bytes — a {"file": {"path": ...}} source is not supported and
+        # triggers an UnboundLocalError in the SDK's content formatter.
+        with open(filename, "rb") as fh:
+            image_bytes = fh.read()
         result = agent.structured_output(
             VisionVerdict,
             [
@@ -284,7 +292,7 @@ class VisionSession:
                         {
                             "image": {
                                 "format": _infer_image_format(filename),
-                                "source": {"file": {"path": filename}},
+                                "source": {"bytes": image_bytes},
                             }
                         },
                         {"text": f"Return reason: {self.reason_code}. Please assess the photo."},

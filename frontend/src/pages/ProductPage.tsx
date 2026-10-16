@@ -1,26 +1,59 @@
 import { useEffect, useState } from 'react';
-import { api, ProductInfo } from '../api/client';
+import { api, ProductDetail } from '../api/client';
 import Header from '../components/Header';
 import ReturnModal from '../components/ReturnModal';
+import ProductImage from '../components/ProductImage';
+import ProductDetailsAccordion from '../components/ProductDetailsAccordion';
 import { useBag } from '../context/BagContext';
+import { trueSizeOffset, formatTrueSize, formatTimestamp } from '../lib/truesize';
 
 const SIZES = ['6', '7', '8', '9', '10', '11'];
 const PRICE = 149.95;
 
 export default function ProductPage() {
-  const [product, setProduct] = useState<ProductInfo | null>(null);
+  const [product, setProduct] = useState<ProductDetail | null>(null);
   const [selectedSize, setSelectedSize] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [addNotice, setAddNotice] = useState('');
   const [sizeError, setSizeError] = useState(false);
   const { addItem } = useBag();
 
+  // Resolve the featured product id, then load its full detail (which carries
+  // the AI listing_change) so the storefront shows the SAME true-size
+  // correction + AI listing box as the /product/:itemId detail page.
   useEffect(() => {
-    api.getProduct().then(setProduct).catch(() => {
-      // Fallback if backend not running
-      setProduct({ item_name: 'ALDO Demo Shoe' });
-    });
+    api
+      .getProduct()
+      .then((info) => {
+        const id = info.item_id;
+        if (id) {
+          return api.getProductDetail(id).catch(() => null).then((detail) => {
+            if (detail) {
+              setProduct(detail);
+            } else {
+              setProduct({
+                item_id: id,
+                item_name: info.item_name,
+                price: PRICE,
+                category: null,
+                description:
+                  'Crafted with premium materials and designed for everyday comfort, this style pairs effortlessly with any wardrobe. A ALDO signature silhouette with a timeless finish.',
+                listing_change: null,
+              });
+            }
+          });
+        }
+      })
+      .catch(() => {
+        setProduct(null);
+      });
   }, []);
+
+  const hasListingChange = !!product?.listing_change;
+  const offset = hasListingChange
+    ? trueSizeOffset(product?.listing_change?.draft_text)
+    : 0;
+  const price = product?.price ?? PRICE;
 
   function handleAddToBag() {
     if (!selectedSize) {
@@ -30,7 +63,7 @@ export default function ProductPage() {
     }
     setSizeError(false);
     const name = product?.item_name ?? 'ALDO Demo Shoe';
-    addItem({ item_name: name, size: selectedSize, price: PRICE });
+    addItem({ item_name: name, size: selectedSize, price });
     setAddNotice(`Added ${name} (size ${selectedSize}) to your bag.`);
   }
 
@@ -39,14 +72,13 @@ export default function ProductPage() {
       <Header onReturnClick={() => setShowModal(true)} />
 
       <main className="max-w-4xl mx-auto px-6 py-12 flex flex-col md:flex-row gap-12">
-        {/* Product image placeholder */}
+        {/* Product image */}
         <div className="flex-shrink-0">
-          <div
-            className="bg-gray-100 w-64 h-64 flex items-center justify-center text-gray-300 text-sm"
-            aria-label="Product image placeholder"
-          >
-            200 × 200
-          </div>
+          <ProductImage
+            itemId={product?.item_id}
+            alt={product?.item_name ?? 'Product'}
+            className="w-80 h-80"
+          />
         </div>
 
         {/* Product info */}
@@ -55,57 +87,89 @@ export default function ProductPage() {
             <h1 className="text-2xl font-semibold tracking-tight text-black uppercase">
               {product?.item_name ?? 'Loading…'}
             </h1>
-            <p className="text-xl mt-1 text-black font-light">${PRICE.toFixed(2)}</p>
+            <p className="text-xl mt-1 text-black font-light">${price.toFixed(2)}</p>
           </div>
 
-          {/* Size guidance banner */}
-          {product?.size_guidance_banner && (
-            <div className="bg-yellow-100 border border-yellow-300 text-yellow-800 px-4 py-2 text-sm rounded">
-              {product.size_guidance_banner}
+          {/* AI listing update */}
+          {product?.listing_change && (
+            <div className="bg-yellow-100 border border-yellow-300 text-yellow-800 px-4 py-3 text-sm rounded">
+              <p className="font-medium uppercase tracking-widest text-xs mb-1">
+                Updated by ALDO (AI listing update)
+              </p>
+              <p className="leading-relaxed">{product.listing_change.draft_text}</p>
+              {product.listing_change.updated_at && (
+                <p className="text-xs text-yellow-700 mt-2">
+                  Updated {formatTimestamp(product.listing_change.updated_at)}
+                </p>
+              )}
             </div>
           )}
 
           {/* Size selector */}
-          <div>
-            <p className="text-xs font-medium uppercase tracking-widest text-gray-500 mb-2">
-              Select size
-            </p>
-            <div className="flex gap-2 flex-wrap">
-              {SIZES.map((size) => (
-                <button
-                  key={size}
-                  onClick={() => {
-                    setSelectedSize(size);
-                    setSizeError(false);
-                  }}
-                  className={`w-12 h-12 border text-sm font-medium transition-colors ${
-                    selectedSize === size
-                      ? 'border-black bg-black text-white'
-                      : 'border-gray-300 text-gray-700 hover:border-black'
-                  }`}
-                >
-                  {size}
-                </button>
-              ))}
+          {product && (
+            <div>
+              <p className="text-xs font-medium uppercase tracking-widest text-gray-500 mb-2">
+                Select size
+                {hasListingChange && (
+                  <span className="ml-2 normal-case tracking-normal text-yellow-700">
+                    (parentheses show AI-corrected true size)
+                  </span>
+                )}
+              </p>
+              <div className="flex gap-2 flex-wrap">
+                {SIZES.map((size) => (
+                  <button
+                    key={size}
+                    onClick={() => {
+                      setSelectedSize(size);
+                      setSizeError(false);
+                    }}
+                    className={`min-w-12 h-12 px-2 border text-sm font-medium transition-colors ${
+                      selectedSize === size
+                        ? 'border-black bg-black text-white'
+                        : 'border-gray-300 text-gray-700 hover:border-black'
+                    }`}
+                  >
+                    {size}
+                    {hasListingChange && (
+                      <span
+                        className={`ml-1 text-xs ${
+                          selectedSize === size ? 'text-gray-300' : 'text-yellow-700'
+                        }`}
+                      >
+                        ({formatTrueSize(size, offset)})
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              {hasListingChange && (
+                <p className="text-xs text-gray-500 mt-2">
+                  True size = the fit this shoe actually runs, based on return data.
+                </p>
+              )}
+              {sizeError && (
+                <p className="text-sm text-red-600 mt-2">Please select a size first.</p>
+              )}
             </div>
-            {sizeError && (
-              <p className="text-sm text-red-600 mt-2">Please select a size first.</p>
-            )}
-          </div>
+          )}
 
           {/* Description */}
-          <p className="text-sm text-gray-600 leading-relaxed max-w-sm">
-            Crafted with premium materials and designed for everyday comfort, this style pairs
-            effortlessly with any wardrobe. A ALDO signature silhouette with a timeless finish.
-          </p>
+          {product && (
+            <p className="text-sm text-gray-600 leading-relaxed max-w-sm">
+              {product.description}
+            </p>
+          )}
 
           {/* Add to bag */}
-          <button
-            onClick={handleAddToBag}
-            className="w-full md:max-w-xs bg-black text-white py-3 text-sm font-medium uppercase tracking-wider hover:bg-gray-800 transition-colors"
-          >
-            Add to bag
-          </button>
+          {product && (
+            <button
+              onClick={handleAddToBag}
+              className="w-full md:max-w-xs bg-black text-white py-3 text-sm font-medium uppercase tracking-wider hover:bg-gray-800 transition-colors"
+            >
+              Add to bag
+            </button>
+          )}
 
           {addNotice && (
             <div
@@ -116,8 +180,23 @@ export default function ProductPage() {
               <span>{addNotice}</span>
             </div>
           )}
+
+          {/* Demo link to an AI-updated listing */}
+          <a
+            href="/product/Ao2eyeleath_mm"
+            className="text-sm text-gray-500 underline underline-offset-2 hover:text-black md:max-w-xs"
+          >
+            View a product with an AI listing update →
+          </a>
         </div>
       </main>
+
+      {/* Product details dropdown */}
+      {product && (
+        <div className="max-w-4xl mx-auto px-6 pb-16">
+          <ProductDetailsAccordion description={product.description} />
+        </div>
+      )}
 
       {showModal && <ReturnModal onClose={() => setShowModal(false)} />}
     </div>

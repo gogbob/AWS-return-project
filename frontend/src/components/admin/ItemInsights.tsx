@@ -207,6 +207,7 @@ export default function ItemInsights() {
                       <ReasonBars reasons={detail.reasons} />
                       {detail.recommendation && (
                         <RecommendationDetail
+                          itemId={item.item_id}
                           recommendation={detail.recommendation}
                           needsInput={detail.needs_input}
                         />
@@ -317,13 +318,16 @@ function ReasonBars({ reasons }: { reasons: ItemInsightReason[] }) {
 }
 
 function RecommendationDetail({
+  itemId,
   recommendation,
   needsInput,
 }: {
+  itemId: string;
   recommendation: NonNullable<ItemInsight['recommendation']>;
   needsInput: boolean;
 }) {
   const isQuality = recommendation.recommendation_type === 'quality_review';
+  const isApplied = recommendation.status === 'applied';
   return (
     <div className="mt-5 pt-4 border-t border-gray-100">
       <h3 className="text-xs font-medium uppercase tracking-wider text-gray-500 mb-2">
@@ -356,6 +360,16 @@ function RecommendationDetail({
         </p>
         {needsInput && !isQuality && (
           <p className="text-xs text-yellow-800">Awaiting admin review before this change is applied.</p>
+        )}
+        {isApplied && (
+          <a
+            href={`/product/${encodeURIComponent(itemId)}`}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-block mt-1 text-xs text-black underline underline-offset-2 hover:text-gray-600"
+          >
+            View live product page with this listing update →
+          </a>
         )}
       </div>
     </div>

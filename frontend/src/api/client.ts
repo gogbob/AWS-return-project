@@ -21,6 +21,7 @@ export interface DemoCustomer {
 }
 
 export interface ProductInfo {
+  item_id?: string;
   item_name: string;
   size_guidance_banner?: string;
 }

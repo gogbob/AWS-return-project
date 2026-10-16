@@ -61,6 +61,22 @@ mappings:
   lost in transit: other      # case variant (last wins — both map the same)
   missing item: other
 
+  # ── UI reason codes (EligibilityStep.tsx sends underscore codes) ──────────
+  # The customer UI submits these granular codes directly; map each to itself
+  # (or into the correct FIT_SIZE/DEFECT group) so the engine's reason_to_code
+  # resolves them to the fine-grained reason rather than falling through to
+  # 'other'. Without these, a stored reason='too_small' would land in 'other'
+  # and never move the too_small bar in the item's return-reason chart.
+  too_small: too_small
+  too_big: too_big
+  too_narrow: too_narrow
+  too_wide: too_wide
+  too_thin: too_narrow          # no canonical too_thin code — FIT_SIZE via too_narrow
+  broken_part: defect
+  damaged: defect
+  not_as_described: not_as_described
+  changed_mind: changed_mind
+
   # ── Empty / unknown ───────────────────────────────────────────────────────
   "": other
 

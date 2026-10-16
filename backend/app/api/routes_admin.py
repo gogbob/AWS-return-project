@@ -693,7 +693,7 @@ def list_item_insights(db: Session = Depends(get_db)):
               AND (r.fraud_flag = 0 OR r.fraud_flag IS NULL)
             GROUP BY r.item_id
             ORDER BY n DESC
-            LIMIT 200
+            LIMIT 1000
             """  # noqa: S608 - placeholders built from a constant tuple only
         )
     ).fetchall()
