@@ -12,6 +12,7 @@ from collections.abc import Generator
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from .config import settings
 
@@ -29,8 +30,13 @@ if _is_sqlite:
     # connections. We use a generously-sized QueuePool with a long checkout
     # timeout; pool_recycle avoids stale handles. (A single-connection
     # StaticPool would serialize every request behind the slowest one.)
+    # Pin QueuePool explicitly: SQLAlchemy 2.1 defaults file-based SQLite to a
+    # SingletonThreadPool, which rejects the pool_size/max_overflow/pool_timeout
+    # kwargs below (and would serialize every request on one connection). WAL
+    # mode (set in the connect pragma) makes a multi-connection pool safe.
     engine = create_engine(
         settings.database_url,
+        poolclass=QueuePool,
         connect_args={"check_same_thread": False, "timeout": 30},
         pool_size=20,
         max_overflow=40,
