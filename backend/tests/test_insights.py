@@ -53,20 +53,32 @@ def _insert_item_with_returns(
             text(
                 "INSERT INTO returns "
                 "(order_number, sku, item_id, customer_uid, "
-                " return_creation_date, last_return_status, reason_code, "
+                " return_creation_date, last_return_status, reason, reason_code, "
                 " source, fraud_flag) "
                 "VALUES (:on, :sku, :iid, :cid, "
-                "        '2025-01-01', 'RETURN_COMPLETED', :rc, 'csv', 0)"
+                "        '2025-01-01', 'RETURN_COMPLETED', :reason, :rc, 'csv', 0)"
             ),
             {
                 "on": f"ORD-{item_id}-{idx}",
                 "sku": item_id,
                 "iid": item_id,
                 "cid": cid,
+                # The insights engine derives the granular code from the free-text
+                # `reason` column via reason_to_code(); store a raw reason that
+                # maps back to the intended code so the test's `rc` label resolves.
+                "reason": _REASON_TEXT_FOR_CODE.get(rc, rc),
                 "rc": rc,
             },
         )
     session.commit()
+
+
+# Raw `reason` text whose taxonomy mapping resolves to the test's code label.
+# Codes that are identity-mapped in reason_taxonomy.yaml (too_small, other, …)
+# are stored as-is; 'defect' has no identity key so use a mapped synonym.
+_REASON_TEXT_FOR_CODE = {
+    "defect": "defective",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +176,16 @@ def test_flagging_with_sufficient_n(test_db: Session) -> None:
     """
     item_id = "ITEM-FLAG-TEST"
     category = "boots"
+
+    # Seed a realistic category baseline: 10+ qualifying peer items with NO
+    # defect returns, so the per-item-median category baseline for 'defect' is
+    # ~0 (the fallback global baseline over a near-empty test DB would instead
+    # be dominated by this single high-volume item, which never happens against
+    # the 650k-row production dataset the thresholds were tuned for).
+    for i in range(12):
+        peer = f"ITEM-FL-PEER-{i:02d}"
+        peer_returns = [(f"CUST-FL-P{i:02d}-{j}", "too_small") for j in range(35)]
+        _insert_item_with_returns(test_db, peer, category, peer_returns)
 
     # 100 unique customers; 80 defect, 20 other
     returns: list[tuple[str, str]] = []

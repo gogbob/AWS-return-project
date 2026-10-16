@@ -26,6 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 # ---------------------------------------------------------------------------
 # Force mock mode before any app module is imported so Settings picks it up.
@@ -46,9 +47,16 @@ from app.main import app  # noqa: E402
 # ---------------------------------------------------------------------------
 # Shared-cache in-memory engine — all connections see the same data
 # ---------------------------------------------------------------------------
+# StaticPool keeps ONE connection alive for the whole engine, shared across the
+# TestClient's worker threads (check_same_thread=False). A shared-cache in-memory
+# SQLite database is destroyed the moment its last connection closes; under the
+# default per-thread pooling that connection can be recycled mid-suite, dropping
+# the database ("Cannot operate on a closed database"). A single persistent
+# connection pins the in-memory DB for the entire test session.
 _TEST_ENGINE = create_engine(
     f"sqlite:///{_TEST_DB_URI}",
     connect_args={"check_same_thread": False, "uri": True},
+    poolclass=StaticPool,
     echo=False,
 )
 _TestSessionLocal = sessionmaker(bind=_TEST_ENGINE, autocommit=False, autoflush=False)
@@ -265,6 +273,24 @@ def test_client(test_db: Session) -> TestClient:
     client = TestClient(app, raise_server_exceptions=True)
     yield client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_baseline_cache() -> Generator[None, None, None]:
+    """
+    Reset the module-level insight baseline cache around every test.
+
+    compute_category_baseline / compute_global_baseline memoize their results
+    in a process-global dict (app.insights.engine._BASELINE_CACHE). Each test
+    rebuilds the in-memory DB with fresh seed data, so a baseline cached by an
+    earlier test would leak stale category/global shares into later ones and
+    make results order-dependent. Clearing before and after keeps tests isolated.
+    """
+    from app.insights.engine import invalidate_baseline_cache
+
+    invalidate_baseline_cache()
+    yield
+    invalidate_baseline_cache()
 
 
 @pytest.fixture(autouse=True)

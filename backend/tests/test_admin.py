@@ -47,20 +47,32 @@ def _insert_item_with_returns(
             text(
                 "INSERT INTO returns "
                 "(order_number, sku, item_id, customer_uid, "
-                " return_creation_date, last_return_status, reason_code, "
+                " return_creation_date, last_return_status, reason, reason_code, "
                 " source, fraud_flag) "
                 "VALUES (:on, :sku, :iid, :cid, "
-                "        '2025-01-01', 'RETURN_COMPLETED', :rc, 'csv', 0)"
+                "        '2025-01-01', 'RETURN_COMPLETED', :reason, :rc, 'csv', 0)"
             ),
             {
                 "on": f"ORD-{item_id}-{idx}",
                 "sku": item_id,
                 "iid": item_id,
                 "cid": cid,
+                # The insights engine derives the granular code from the free-text
+                # `reason` column via reason_to_code(); store a raw reason that
+                # maps back to the intended code so the test's `rc` label resolves.
+                "reason": _REASON_TEXT_FOR_CODE.get(rc, rc),
                 "rc": rc,
             },
         )
     session.commit()
+
+
+# Raw `reason` text whose taxonomy mapping resolves to the test's code label.
+# Codes that are identity-mapped in reason_taxonomy.yaml (too_small, other, …)
+# are stored as-is; 'defect' has no identity key so use a mapped synonym.
+_REASON_TEXT_FOR_CODE = {
+    "defect": "defective",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +319,7 @@ def test_no_loyalty_leak_in_assistant_messages(
             "order_number": "ORD-HIGH-001",
             "sku": "SKU-001",
             "item_id": "ITEM-BOOTS",
-            "reason_code": "FIT_SIZE",
+            "reason": "too small",
         },
     )
     assert start_resp.status_code == 200, f"start_return failed: {start_resp.text}"
@@ -357,6 +369,10 @@ def test_no_loyalty_leak_in_assistant_messages(
 # GET /api/admin/item-insights — per-item return-reason insights page
 # ---------------------------------------------------------------------------
 
+# The cheap list endpoint returns only these lightweight keys per row.
+_ITEM_LIST_KEYS = {"item_id", "item_name", "category", "n"}
+
+# The on-demand detail endpoint (/item-insights/{item_id}) returns the full shape.
 _ITEM_INSIGHT_KEYS = {
     "item_id",
     "item_name",
@@ -399,13 +415,32 @@ def test_item_insights_shape_and_overshoot(
         returns.append((f"CUST-DEF-O{j}", "other"))
     _insert_item_with_returns(test_db, "ITEM-DEFECT", "boots", returns)
 
+    # The list endpoint is intentionally CHEAP: one lightweight row per item
+    # ({item_id, item_name, category, n}) with NO per-item distribution /
+    # baseline / anomaly computation. The expensive analytics are computed
+    # lazily by GET /item-insights/{item_id} when a row is expanded.
     resp = test_client.get("/api/admin/item-insights")
     assert resp.status_code == 200, f"item-insights failed: {resp.text}"
     data = resp.json()
     assert isinstance(data, list) and len(data) > 0, "Expected a non-empty list"
 
-    # Every object has the documented keys; each reason has its keys.
     for obj in data:
+        assert _ITEM_LIST_KEYS.issubset(obj.keys()), (
+            f"Missing list keys: {_ITEM_LIST_KEYS - set(obj.keys())}"
+        )
+        assert isinstance(obj["n"], int) and obj["n"] > 0
+
+    by_id = {obj["item_id"]: obj for obj in data}
+    assert "ITEM-DEFECT" in by_id, "Seeded high-defect item should appear"
+    assert "ITEM-BOOTS" in by_id, "Conftest boots item should appear"
+
+    # Expand each item via the detail endpoint and validate the full shape.
+    details: dict[str, dict] = {}
+    for iid in ("ITEM-DEFECT", "ITEM-BOOTS"):
+        d_resp = test_client.get(f"/api/admin/item-insights/{iid}")
+        assert d_resp.status_code == 200, f"detail failed for {iid}: {d_resp.text}"
+        obj = d_resp.json()
+        details[iid] = obj
         assert _ITEM_INSIGHT_KEYS.issubset(obj.keys()), (
             f"Missing keys: {_ITEM_INSIGHT_KEYS - set(obj.keys())}"
         )
@@ -417,28 +452,16 @@ def test_item_insights_shape_and_overshoot(
             assert 0.0 <= reason["item_share"] <= 1.0
             assert 0.0 <= reason["baseline_share"] <= 1.0
 
-    by_id = {obj["item_id"]: obj for obj in data}
-    assert "ITEM-DEFECT" in by_id, "Seeded high-defect item should appear"
-    assert "ITEM-BOOTS" in by_id, "Conftest boots item should appear"
-
     # The conftest ITEM-BOOTS (76% too_small vs ~22% baseline) overshoots on a
-    # significant FIT_SIZE flag; it must be flagged and sorted ahead of neutral
-    # items with its worst reason reported in top_flag/max_excess.
-    boots = by_id["ITEM-BOOTS"]
+    # significant FIT_SIZE flag, with its worst reason reported in top_flag.
+    boots = details["ITEM-BOOTS"]
     assert boots["overshoot"] is True, "ITEM-BOOTS must overshoot on too_small"
     assert boots["top_flag"] is not None
     assert boots["top_flag"]["reason_code"] == "too_small"
     assert boots["max_excess"] > 0
 
-    # Overshooting items are sorted ahead of non-overshooting ones, by max_excess.
-    assert data[0]["overshoot"] is True, "Most-concerning item must sort first"
-    overshoot_run_ended = False
-    for obj in data:
-        if obj["overshoot"]:
-            assert not overshoot_run_ended, "Overshooting items must group first"
-        else:
-            overshoot_run_ended = True
-
-    # No loyalty/suspicion/fraud leak in keys or string values.
-    violations = _contains_forbidden(data)
+    # No loyalty/suspicion/fraud leak in keys or string values (list or detail).
+    violations = _contains_forbidden(data) + _contains_forbidden(
+        list(details.values())
+    )
     assert violations == [], f"Forbidden tokens in item-insights: {violations}"
