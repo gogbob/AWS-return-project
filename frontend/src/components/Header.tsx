@@ -40,15 +40,7 @@ export default function Header({ onReturnClick }: HeaderProps) {
             className="border border-gray-300 rounded px-2 py-1 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-black"
           >
             {customers.map((c) => (
-              <option
-                key={c.id}
-                value={c.id}
-                title={
-                  import.meta.env.DEV && c.loyalty_dev != null
-                    ? `Loyalty: ${c.loyalty_dev}`
-                    : undefined
-                }
-              >
+              <option key={c.id} value={c.id}>
                 {c.label}
               </option>
             ))}

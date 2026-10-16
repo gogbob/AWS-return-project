@@ -162,7 +162,14 @@ def compute_triage(case_id: str, db: Session) -> TriageResult:
     }
 
     # ── Step 5: routing ───────────────────────────────────────────────────────
-    if suspicion < settings.suspicion_threshold:
+    # Weak purchase history (below low_history_threshold) always goes through
+    # the photo/vision flow as friction — the customer is asked for photos of
+    # the shoe to "evaluate size" before the return is accepted (with a fee)
+    # and queued for human review. Otherwise, low suspicion auto-approves.
+    if loyalty < settings.low_history_threshold:
+        outcome = TriageOutcome.VISION_REVIEW
+        fee = 0.0  # fee decided after the photo-friction flow completes
+    elif suspicion < settings.suspicion_threshold:
         outcome = TriageOutcome.APPROVED_WITH_FEE
         fee = settings.shipping_fee_cad
     else:

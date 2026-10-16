@@ -24,6 +24,10 @@ export default function ChatWindow({ caseId, initialMessage, initialState }: Cha
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Set once a terminal outcome has been shown (by an action handler OR the
+  // poll) so we never append a second "approved/rejected" message for the
+  // same case — this prevents the phantom duplicate after the final photo.
+  const resolvedRef = useRef(false);
 
   // scroll to bottom on new messages
   useEffect(() => {
@@ -32,17 +36,26 @@ export default function ChatWindow({ caseId, initialMessage, initialState }: Cha
 
   // poll when in review states
   useEffect(() => {
-    if (POLLING_STATES.includes(state)) {
+    // Only poll while waiting on an out-of-band (admin) decision, and never
+    // once a terminal outcome has already been shown.
+    if (POLLING_STATES.includes(state) && !resolvedRef.current) {
       pollRef.current = setInterval(async () => {
         try {
           const s = await api.getCaseState(caseId);
-          if (s.state !== state) {
+          if (s.state !== state && FINAL_STATES.includes(s.state)) {
+            if (pollRef.current) clearInterval(pollRef.current);
             setState(s.state);
-            if (FINAL_STATES.includes(s.state)) {
-              if (pollRef.current) clearInterval(pollRef.current);
+            // Guard against a race with an action handler that already
+            // displayed the terminal message for this case.
+            if (!resolvedRef.current) {
+              resolvedRef.current = true;
               const label = stateLabel(s.state, s.fee);
-              setMessages((prev) => [...prev, { role: 'assistant', content: label }]);
+              if (label) {
+                setMessages((prev) => [...prev, { role: 'assistant', content: label }]);
+              }
             }
+          } else if (s.state !== state) {
+            setState(s.state);
           }
         } catch {
           // ignore transient errors
@@ -73,6 +86,12 @@ export default function ChatWindow({ caseId, initialMessage, initialState }: Cha
       setMessages((prev) => [...prev, { role: 'assistant', content: resp.message }]);
       setState(resp.state);
       if (resp.vision_requested) setVisionRequested(true);
+      // This turn produced the terminal outcome — stop the poll from
+      // re-announcing it.
+      if (FINAL_STATES.includes(resp.state)) {
+        resolvedRef.current = true;
+        if (pollRef.current) clearInterval(pollRef.current);
+      }
     } catch (err: unknown) {
       setMessages((prev) => [
         ...prev,
@@ -102,6 +121,12 @@ export default function ChatWindow({ caseId, initialMessage, initialState }: Cha
       setMessages((prev) => [...prev, { role: 'assistant', content: resp.message }]);
       setState(resp.state);
       if (!resp.vision_requested) setVisionRequested(false);
+      // The final photo produced the terminal outcome ($7 fee + review); stop
+      // the poll so it can't append a second, generic approval message.
+      if (FINAL_STATES.includes(resp.state)) {
+        resolvedRef.current = true;
+        if (pollRef.current) clearInterval(pollRef.current);
+      }
     } catch {
       setMessages((prev) => [
         ...prev,

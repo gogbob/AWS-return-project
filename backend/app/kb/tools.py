@@ -387,8 +387,9 @@ def escalate_to_vision_review(case_id: str) -> dict:
         return {
             "success": True,
             "message": (
-                "To complete your return, we need a few photos of the item. "
-                "Please upload clear images so our team can process your request."
+                "To complete your return, please upload a photo of the shoe "
+                "against a plain background so we can evaluate the size and fit. "
+                "You can use the upload button below."
             ),
         }
     except Exception as exc:
@@ -420,8 +421,10 @@ def escalate_to_human(case_id: str, reason: str) -> dict:
         return {
             "success": True,
             "message": (
-                "Your return request has been escalated to our customer service team. "
-                "A representative will follow up with you within 1–2 business days."
+                "Your return has been accepted and you can send the item back. "
+                "Because of your recent return activity, a team member will review "
+                "this return before your refund is finalized — this helps us keep "
+                "returns fair for everyone. You'll get an update within 1–2 business days."
             ),
         }
     except Exception as exc:

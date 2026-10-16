@@ -118,7 +118,11 @@ export default function ItemInsights() {
         {items.map((item) => {
           const open = openId === item.item_id;
           const detail = details[item.item_id];
-          const overshoot = detail?.overshoot ?? false;
+          // Red in the list BEFORE expanding when the item already has an
+          // applied listing change (item.flagged from the cheap list query);
+          // once expanded, the loaded detail's overshoot confirms/refreshes it.
+          const flagged = (item.flagged ?? false) || (detail?.overshoot ?? false);
+          const overshoot = flagged;
           const panelId = `item-insight-panel-${item.item_id}`;
           return (
             <li

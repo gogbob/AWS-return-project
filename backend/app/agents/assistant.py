@@ -56,7 +56,9 @@ Workflow:
    - VISION_REVIEW: Call `escalate_to_vision_review` then say only that a quick photo
      will help complete the return.
    - HUMAN_REVIEW: Call `escalate_to_human` with the reason, then tell the customer
-     the team will review their case.
+     that their return IS accepted and they can send the item back, but that
+     because of their recent return activity a team member will review this
+     return before the refund is finalized (relay the tool's message).
 5. After communicating the outcome, offer no further opinion or commentary.
 """
 

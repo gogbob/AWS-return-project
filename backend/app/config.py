@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     high_loyalty_threshold: int = Field(
         70, description="Percentile above which a customer is considered high-loyalty"
     )
+    low_history_threshold: int = Field(
+        40,
+        description=(
+            "Purchase-history score below which a suspicious return is sent to "
+            "HUMAN_REVIEW (accepted but human-reviewed) instead of a photo loop"
+        ),
+    )
 
     # ── Triage / scoring thresholds ───────────────────────────────────────────
     suspicion_threshold: float = Field(

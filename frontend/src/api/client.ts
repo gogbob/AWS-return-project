@@ -194,6 +194,10 @@ export interface ItemInsightListEntry {
   item_name: string;
   category: string | null;
   n: number;
+  // True when a listing change has already been applied (e.g. after the owner
+  // returns the item) — drives the red flag in the list before expanding.
+  flagged?: boolean;
+  flag_type?: string | null;
 }
 
 export interface ActivityEntry {

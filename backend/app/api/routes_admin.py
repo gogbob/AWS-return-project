@@ -720,17 +720,43 @@ def list_item_insights(db: Session = Depends(get_db)):
     ).fetchall()
     names = {r[0]: (r[1], r[2]) for r in name_rows}
 
+    # Cheap "flagged" signal WITHOUT running the heavy per-item analytics for
+    # every row: an item is shown red/flagged in the list if it has an APPLIED
+    # recommendation (size_guidance / description_update / quality_review /
+    # delist). That is exactly what the owner-return auto-apply writes, so an
+    # item that was just changed shows red immediately — before it is expanded.
+    flagged_rows = db.execute(
+        text(
+            f"""
+            SELECT DISTINCT item_id, recommendation_type
+            FROM recommendations
+            WHERE status = 'applied'
+              AND item_id IN ({id_placeholders})
+            """  # noqa: S608 - placeholders are bound parameters (reused)
+        ),
+        params,
+    ).fetchall()
+    flagged: dict[str, str] = {}
+    for iid, rtype in flagged_rows:
+        # Keep the first type seen; delist/quality_review imply a defect flag.
+        flagged.setdefault(iid, rtype)
+
     results = [
         {
             "item_id": iid,
             "item_name": names[iid][0],
             "category": names[iid][1],
             "n": counts[iid],
+            # True once a listing change has been applied for this item.
+            "flagged": iid in flagged,
+            "flag_type": flagged.get(iid),
         }
         for iid in ids
         if iid in names
     ]
-    results.sort(key=lambda x: x["n"], reverse=True)
+    # Flagged items float to the top so a just-changed product is immediately
+    # visible, then by return volume.
+    results.sort(key=lambda x: (x["flagged"], x["n"]), reverse=True)
     return results
 
 

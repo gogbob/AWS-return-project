@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 import uuid
 from datetime import datetime
 from math import asin, cos, radians, sin, sqrt
@@ -43,9 +45,9 @@ router = APIRouter()
 # returnable-item list reflects actual order history. The public-facing "id"
 # is a stable synthetic key; `uid` is what the data layer filters on.
 _DEMO_CUSTOMERS: list[dict] = [
-    {"id": "CUST-OWNER", "uid": "SID:OWNER-ALDO", "label": "Owner of ALDO", "_loyalty": 100},  # owner — very high priority
-    {"id": "CUST-LOYAL", "uid": "SID:10005372135022", "label": "Loyal Customer", "_loyalty": 95},    # high loyalty
-    {"id": "CUST-UNLOYAL", "uid": "SID:102909224525987", "label": "Unloyal Customer", "_loyalty": 8},  # low loyalty
+    {"id": "CUST-OWNER", "uid": "SID:OWNER-ALDO", "label": "Return Populator", "_loyalty": 100},  # high-impact populator
+    {"id": "CUST-LOYAL", "uid": "SID:10005372135022", "label": "Customer A", "_loyalty": 95},    # strong purchase history
+    {"id": "CUST-UNLOYAL", "uid": "SID:102909224525987", "label": "Customer B", "_loyalty": 8},  # weak purchase history
 ]
 
 # The Owner's DB loyalty is deliberately OUTSIZED (not the UI band above) so a
@@ -78,6 +80,26 @@ def _ensure_owner_customer(db: Session) -> None:
         {"uid": _OWNER_UID, "loyalty": _OWNER_DB_LOYALTY},
     )
     db.commit()
+
+
+def _apply_response_friction(customer_id: Optional[str], db: Session) -> None:
+    """
+    Add deliberate friction (a 2–3s pause) before the return agent responds to
+    customers with a WEAK purchase history, so low-trust accounts get a slower,
+    more scrutinised experience. Customers with a strong history are unaffected.
+
+    The threshold reuses settings.high_loyalty_threshold (the internal
+    purchase-history score); anything below it is treated as "weak history".
+    Guarded so it can never raise into the request path.
+    """
+    try:
+        if not customer_id:
+            return
+        score = get_loyalty(customer_id, db)
+        if score < settings.high_loyalty_threshold:
+            time.sleep(random.uniform(2.0, 3.0))
+    except Exception:  # noqa: BLE001 - friction must never break a response
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -511,10 +533,12 @@ def _log_triage_decision(case_id: str, db: Session) -> None:
 
     # Pick the dominant reason driver for a plain-English explanation.
     drivers = {
-        "customer loyalty": loyalty_c,
+        "customer purchase history": loyalty_c,
         "believability of the reason": implaus_c + claim_c,
     }
-    main_driver = max(drivers, key=drivers.get) if any(drivers.values()) else "customer loyalty"
+    main_driver = (
+        max(drivers, key=drivers.get) if any(drivers.values()) else "customer purchase history"
+    )
 
     outcome = result.outcome.value
 
@@ -576,18 +600,21 @@ def _log_triage_decision(case_id: str, db: Session) -> None:
         if held:
             weight_text = "0.00 (held — flagged for review)"
             detail_text = (
-                f"(reason: {friendly_reason}, loyalty {loyalty} — "
+                f"(reason: {friendly_reason} — "
                 "held pending review, not yet counted)"
             )
         else:
             weight_text = f"{weight:.2f}"
             if loyalty >= settings.high_loyalty_threshold:
                 detail_text = (
-                    f"(reason: {friendly_reason}, loyalty {loyalty} — "
-                    "high-loyalty customer, weighted more heavily)"
+                    f"(reason: {friendly_reason} — this customer's purchase "
+                    "history gives their returns more weight)"
                 )
             else:
-                detail_text = f"(reason: {friendly_reason}, loyalty {loyalty})"
+                detail_text = (
+                    f"(reason: {friendly_reason} — weighted by customer "
+                    "purchase history)"
+                )
 
         _append_ai_log(
             case_id,
@@ -845,6 +872,10 @@ def start_return(body: StartReturnRequest, db: Session = Depends(get_db)):
     #     admin activity log (case_messages role='ai_log').
     _log_triage_decision(case_id, db)
 
+    # Friction: customers with a weak purchase history wait 2–3s before the
+    # agent's first reply too, so the whole conversation feels slower for them.
+    _apply_response_friction(resolved_uid, db)
+
     # 3. Start assistant session — generate initial greeting.
     # Resolve a friendly product name so the agent greets by product, not an id.
     name_row = db.execute(
@@ -945,6 +976,9 @@ def send_message(case_id: str, body: SendMessageRequest, db: Session = Depends(g
             "state": "STOPPED",
             "vision_requested": False,
         }
+
+    # Friction: customers with a weak purchase history wait 2–3s per response.
+    _apply_response_friction(customer_id, db)
 
     # Persist user message
     db.execute(
@@ -1100,13 +1134,13 @@ async def upload_photo(
 
     # Load case
     case_row = db.execute(
-        text("SELECT reason_code, status FROM cases WHERE id = :cid"),
+        text("SELECT reason_code, status, customer_id FROM cases WHERE id = :cid"),
         {"cid": case_id},
     ).fetchone()
     if not case_row:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    reason_code, current_status = case_row
+    reason_code, current_status, case_customer_id = case_row
 
     # Save file
     upload_dir = _UPLOAD_ROOT / case_id
@@ -1122,10 +1156,31 @@ async def upload_photo(
         {"cid": case_id},
     ).scalar() or 0
 
-    # Run vision session
+    # Run vision session (still runs the real model so the verdict is stored).
     session = VisionSession(case_id=case_id, reason_code=reason_code or "other")
     session.attempt = prior_count  # resume retry counter
     action, verdict = session.evaluate(str(file_path))
+
+    # ── Weak purchase-history friction override ──────────────────────────────
+    # For a low-history customer we run a DETERMINISTIC two-photo friction flow
+    # regardless of what the vision model concludes:
+    #   photo 1  → always ask for a second angle ("evaluate size")
+    #   photo 2+ → always ACCEPT with a $7 fee and tell them a human will review.
+    # This is friction, not a real fraud gate, so it ignores the verdict.
+    low_history = False
+    try:
+        if case_customer_id:
+            low_history = get_loyalty(case_customer_id, db) < settings.low_history_threshold
+    except Exception:  # noqa: BLE001
+        low_history = False
+
+    friction_fee: Optional[float] = None
+    if low_history:
+        if prior_count == 0:
+            action = "ask_again"
+        else:
+            action = "approved_with_fee"
+            friction_fee = 7.0
 
     verdict_json = verdict.model_dump_json()
 
@@ -1159,16 +1214,31 @@ async def upload_photo(
     db.commit()
 
     # Build a user-facing message
+    fee_amount = friction_fee if friction_fee is not None else settings.shipping_fee_cad
     _ACTION_MESSAGES: dict[str, str] = {
         "approved_no_fee": "Your return has been approved with no restocking fee.",
-        "approved_with_fee": f"Your return has been approved. A ${settings.shipping_fee_cad:.2f} CAD restocking fee applies.",
+        "approved_with_fee": (
+            f"Thanks — your return is approved with a ${fee_amount:.2f} return fee. "
+            "Because of your recent return activity, a team member will also review "
+            "this return before the refund is finalized. You'll get an update within "
+            "1–2 business days."
+            if low_history
+            else f"Your return has been approved. A ${fee_amount:.2f} CAD restocking fee applies."
+        ),
         "human_review": (
-            "Your return has been escalated to our customer service team. "
-            "A representative will follow up within 1–2 business days."
+            "Your return has been accepted and you can send the item back. "
+            "A team member will review this return before your refund is "
+            "finalized, and you'll get an update within 1–2 business days."
         ),
         "ask_again": (
-            "The photo wasn't quite clear enough. "
-            "Could you submit another photo showing the item from a different angle?"
+            "Thanks. To help us evaluate the fit and size, could you upload one "
+            "more photo of the shoe from a different angle (against a plain "
+            "background if possible)?"
+            if low_history
+            else (
+                "The photo wasn't quite clear enough. "
+                "Could you submit another photo showing the item from a different angle?"
+            )
         ),
     }
     assistant_message = _ACTION_MESSAGES.get(
@@ -1179,6 +1249,7 @@ async def upload_photo(
     return {
         "verdict": verdict.verdict,
         "state": new_state,
+        "fee": friction_fee,
         # Frontend reads `message`; vision_requested=True only if another photo
         # is needed (ask_again → still VISION_REVIEW).
         "message": assistant_message,
@@ -1214,8 +1285,9 @@ def refuse_photo(case_id: str, db: Session = Depends(get_db)):
         "state": "HUMAN_REVIEW",
         # Frontend reads `message`.
         "message": (
-            "No problem. Your return has been escalated to our customer service team. "
-            "A representative will follow up within 1–2 business days."
+            "No problem — your return is accepted and you can send the item back. "
+            "A team member will review it before your refund is finalized, and "
+            "you'll get an update within 1–2 business days."
         ),
         "vision_requested": False,
     }
