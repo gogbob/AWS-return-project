@@ -211,6 +211,17 @@ export interface DataHealth {
   unmapped_reasons: Array<{ value: string; count: number; first_seen: string }>;
 }
 
+export interface DataSource {
+  backend_in_use: string;
+  aws_available: boolean;
+  s3_bucket: string;
+  glue_database: string;
+  athena_results: string;
+  tables_registered: string[];
+  last_athena_query_id: string | null;
+  row_counts_source: string;
+}
+
 // ── API functions ─────────────────────────────────────────────────────────────
 
 export const api = {
@@ -353,6 +364,10 @@ export const api = {
 
   getDataHealth(): Promise<DataHealth> {
     return request('/admin/data-health');
+  },
+
+  getDataSource(): Promise<DataSource> {
+    return request('/admin/data-source');
   },
 
   recompute(): Promise<void> {

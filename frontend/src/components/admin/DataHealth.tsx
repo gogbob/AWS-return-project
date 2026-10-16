@@ -1,16 +1,18 @@
 import { useEffect, useState } from 'react';
-import { api, DataHealth as DataHealthType } from '../../api/client';
+import { api, DataHealth as DataHealthType, DataSource } from '../../api/client';
 
 export default function DataHealth() {
   const [data, setData] = useState<DataHealthType | null>(null);
+  const [source, setSource] = useState<DataSource | null>(null);
   const [loading, setLoading] = useState(true);
   const [recomputing, setRecomputing] = useState(false);
 
   async function load() {
     setLoading(true);
     try {
-      const d = await api.getDataHealth();
+      const [d, s] = await Promise.all([api.getDataHealth(), api.getDataSource()]);
       setData(d);
+      setSource(s);
     } finally {
       setLoading(false);
     }
@@ -55,6 +57,26 @@ export default function DataHealth() {
           {data.last_ingest ? new Date(data.last_ingest).toLocaleString() : 'Never'}
         </p>
       </div>
+
+      {/* Analytics backend */}
+      {source && (
+        <div>
+          <p className="text-xs text-gray-500 uppercase font-medium mb-1">Analytics backend</p>
+          <p className="text-sm font-mono">{source.backend_in_use.toUpperCase()}</p>
+          <p className="text-xs text-gray-500 mt-1">
+            AWS available: <span className="font-mono">{source.aws_available ? 'yes' : 'no'}</span>
+          </p>
+          <p className="text-xs text-gray-500">
+            S3 bucket: <span className="font-mono">{source.s3_bucket}</span>
+          </p>
+          <p className="text-xs text-gray-500">
+            Glue database: <span className="font-mono">{source.glue_database}</span>
+          </p>
+          <p className="text-xs text-gray-500">
+            Last Athena query: <span className="font-mono">{source.last_athena_query_id ?? '—'}</span>
+          </p>
+        </div>
+      )}
 
       {/* Row counts */}
       <div>

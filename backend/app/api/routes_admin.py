@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .. import aws
 from ..config import settings
 from ..db import get_db
 from ..insights.engine import (
@@ -27,6 +28,7 @@ from ..insights.engine import (
     compute_js_distance,
     recompute_category_baselines,
 )
+from ..insights.sources import last_athena_query_id, select_baseline_source
 
 # Import the customer list so we can derive display labels for cases.
 from .routes_customer import _DEMO_CUSTOMERS, CUSTOMER_LABEL_MAP
@@ -1056,6 +1058,42 @@ def data_health(db: Session = Depends(get_db)):
         "last_ingest_time": last_ingest_time,
         "row_counts": row_counts,
         "unmapped_reasons": unmapped_reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8b. GET /api/admin/data-source — which analytics backend serves baselines
+# ---------------------------------------------------------------------------
+
+
+@router.get("/data-source")
+def data_source(db: Session = Depends(get_db)):
+    """
+    Report which analytics backend (Athena / DuckDB / SQLite) currently serves
+    the category/global baselines, plus the S3 / Glue / Athena wiring for the
+    admin console. Cheap and non-blocking: it runs NO new Athena query — only an
+    optional, guarded Glue get_tables lookup (returns [] if Glue is denied or
+    unavailable).
+    """
+    backend_in_use = getattr(select_baseline_source(settings), "name", "sqlite")
+
+    # Optional, guarded: list registered Glue tables without raising.
+    tables_registered: list[str] = []
+    try:
+        resp = aws.glue_client().get_tables(DatabaseName=settings.glue_database)
+        tables_registered = [t["Name"] for t in resp.get("TableList", [])]
+    except Exception:
+        tables_registered = []
+
+    return {
+        "backend_in_use": backend_in_use,
+        "aws_available": aws.aws_available(),
+        "s3_bucket": settings.s3_bucket,
+        "glue_database": settings.glue_database,
+        "athena_results": settings.athena_results_s3,
+        "tables_registered": tables_registered,
+        "last_athena_query_id": last_athena_query_id(),
+        "row_counts_source": backend_in_use,
     }
 
 
