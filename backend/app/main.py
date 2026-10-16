@@ -15,7 +15,6 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
 
 from .db import Base, engine
 
@@ -38,37 +37,66 @@ def _warm_insight_baselines() -> None:
     scans the returns table once and is then memoized in the engine; computing
     them here (in a background thread at startup) keeps that one-time cost off
     the user's first interaction. Failures are non-fatal.
+
+    ONLY the category/global baselines are routed through the selected data
+    backend (SQLite / DuckDB / Athena) via app.insights.sources. The per-item
+    distribution/anomaly path and the owner-return auto-apply recompute stay on
+    SQLite in engine.py, so the Quincey/owner "too_small" demo keeps reflecting
+    live rows instantly. The warm walks the athena -> duckdb -> sqlite fallback
+    chain and never crashes startup.
     """
     try:
+        from .config import settings
         from .db import SessionLocal
-        from .insights.engine import (
-            compute_category_baseline,
-            compute_global_baseline,
-            invalidate_baseline_cache,
-        )
+        from .insights.engine import invalidate_baseline_cache
+        from .insights import sources
 
         # Clear any memoized baselines first so a restart never serves stale
         # entries (e.g. baselines keyed by old coarse groups) — the warm below
         # then repopulates the cache with the current granular reason codes.
         invalidate_baseline_cache()
 
-        db = SessionLocal()
-        try:
-            compute_global_baseline(db)
-            cats = [
-                r[0]
-                for r in db.execute(
-                    text(
-                        "SELECT DISTINCT category FROM order_items "
-                        "WHERE category IS NOT NULL"
-                    )
-                ).fetchall()
-            ]
-            for cat in cats:
-                compute_category_baseline(cat, db)
-            print(f"[startup] warmed insight baselines for {len(cats)} categories")
-        finally:
-            db.close()
+        # Build the fallback order starting from the selected source, de-duped,
+        # always ending at SQLite (the always-correct reference).
+        selected = sources.select_baseline_source(settings)
+        chain: list = [selected]
+        for cls in (
+            sources.AthenaBaselineSource,
+            sources.DuckDBBaselineSource,
+            sources.SqliteBaselineSource,
+        ):
+            if not any(isinstance(s, cls) for s in chain):
+                chain.append(cls())
+
+        last_exc: Exception | None = None
+        for source in chain:
+            db = SessionLocal()
+            try:
+                # Re-clear so a partial previous attempt never leaves a mix of
+                # backends in the cache.
+                invalidate_baseline_cache()
+                cats = sources.populate_baseline_cache(source, db)
+                extra = ""
+                if source.name == "athena":
+                    qid = sources.last_athena_query_id()
+                    extra = f" (athena query id {qid})" if qid else ""
+                print(
+                    f"[startup] warmed insight baselines for {len(cats)} "
+                    f"categories via '{source.name}'{extra}"
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - try the next backend
+                last_exc = exc
+                print(
+                    f"[startup] baseline backend '{source.name}' failed "
+                    f"({exc}); falling back"
+                )
+            finally:
+                db.close()
+
+        # Should be unreachable: SqliteBaselineSource is always last and
+        # delegates to the engine SQL that already works.
+        print(f"[startup] baseline warm skipped: {last_exc}")
     except Exception as exc:  # noqa: BLE001 - warming must never crash startup
         print(f"[startup] baseline warm skipped: {exc}")
 
